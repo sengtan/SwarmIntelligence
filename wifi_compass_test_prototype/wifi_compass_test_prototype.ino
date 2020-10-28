@@ -2,7 +2,41 @@
  *  -Try to keep medium tasks <=2ms, low tasks <=15ms
  *  -NodeMCU Soft Access Point can handle max 5 connections
  */
- 
+/*QMC5883L Codes----------------------------------------------------------------*/
+#include <QMC5883L.h>
+#include <Wire.h>
+QMC5883L compass;
+void QMC5883L_setup(){
+  compass.init();
+  //compass.setCalibration(3710,-5240,6042,-5175);
+  //Serial.println("Turn compass in all directions to calibrate....");
+}
+void QMC5883L_print(){
+  int16_t xmax,xmin,ymax,ymin;
+  float heading = compass.readHeading();
+  if(heading==0) {
+    /* Still calibrating, so measure but don't print */
+  } 
+  else {
+    compass.readCal(&xmax,&xmin,&ymax,&ymin);
+    //Serial.print("H:");
+    Serial.print(",");
+    Serial.print(heading);
+    //Serial.print(" X:");
+    Serial.print(",");
+    Serial.print(xmax);
+    //Serial.print(" x:");
+    Serial.print(",");
+    Serial.print(xmin);
+    //Serial.print(" Y:");
+    Serial.print(",");
+    Serial.print(ymax);
+    //Serial.print(" y:");
+    Serial.print(",");
+    Serial.print(ymin);
+  }
+}
+/*End of QMC5883L Codes---------------------------------------------------------*/
 /*WiFi Codes------------------------------------------------------------------*/
 /* The scanNetwork and saveNetwork functions will delete all previously saved wifi info,
  * scans for available wifi signals, then sort it according to RSSI in descending order,
@@ -25,6 +59,7 @@ typedef struct{
 } wifiNetwork;    //wifi into structure/map
 
 wifiNetwork availableNetworks[WIFI_MAX];  //declares an array to store network info
+char ownMAC[WIFI_CHAR];
 bool scanCompleted = 0; //0 if haven't complete scanning, 1 if done
 int samples = 0;
 
@@ -39,6 +74,22 @@ void scanNetwork(){
 #include <list>
 #include "painlessMesh.h"
 Task scanNodes(0,TASK_ONCE,&scanNetwork);
+
+void saveOwnMac(){
+  WiFi.macAddress().toCharArray(ownMAC,sizeof(ownMAC));
+  char tempMAC[sizeof(ownMAC)];  //temporary storage for MAC without ':'
+  int tempMACnum = 0; //counter for temporary storage
+  for(int k = 0;k<sizeof(ownMAC);k++){
+    if(ownMAC[k] != ':'){ //find and remove ':' characters
+      tempMAC[tempMACnum] = ownMAC[k];  //store non-':' char into temp storage
+      tempMACnum++;
+    }
+    ownMAC[k] = 0;  //clear original storage
+  }
+  for(int L = 0;L<tempMACnum;L++){
+    ownMAC[L] = tempMAC[L]; //copy over non-':' char from temp storage to cleared original storage
+  }
+}
 
 void saveNetwork(int networksFound){
   int swarmNetworks = 0;
@@ -82,7 +133,8 @@ void saveNetwork(int networksFound){
       }
     }
     /*Print out data into excel sheet*/
-    Serial.printf("DATA,TIME,%d",samples);
+    Serial.printf("DATA,TIME,%d,",samples);
+    Serial.print(ownMAC);
     for(int i = 0;i<swarmNetworks;i++){
       if(strcmp(availableNetworks[i].ssid,WIFI_SSID)==0){ //check if SSID is "Swarm_Intel" although theoretically should only have that
         Serial.print(",");
@@ -90,6 +142,7 @@ void saveNetwork(int networksFound){
         Serial.printf(",%d",availableNetworks[i].rssi);
       }
     }
+    QMC5883L_print();
     Serial.println(",AUTOSCROLL_20"); //to autoscroll excel sheet and go to next line
   }
   else{ //Stores all known SSIDs
@@ -169,8 +222,9 @@ void meshSetup(){
   selfNodeID = mesh.getNodeId();
   currentMaster = selfNodeID;
   addSelfToNodeList();
+  saveOwnMac();
   Serial.println("CLEARSHEET");
-  Serial.println("LABEL,timestamp,sample,MAC_1,RSSI_1,MAC_2,RSSI_2,MAC_3,RSSI_3,MAC_4,RSSI_4,MAC_5,RSSI_5");
+  Serial.println("LABEL,timestamp,sample,ownMAC,heading,X,x,Y,y,MAC_1,RSSI_1,MAC_2,RSSI_2,MAC_3,RSSI_3,MAC_4,RSSI_4,MAC_5,RSSI_5");
   scanNodes.enable();
 }
 void onChangedConnections(){
@@ -214,6 +268,8 @@ const uint8_t sda = D3;
 
 void setup() {
   Serial.begin(115200);
+  Wire.begin(sda,scl);
+  QMC5883L_setup();
   meshSetup();
 }
 
