@@ -4,10 +4,11 @@
  */
 /*WiFi Codes------------------------------------------------------------------*/
 #include <ESP8266WiFi.h>
-//#include <list>
+#include <list>
 #define WIFI_MODE WIFI_AP_STA //set wifi mode here, AP_STA is access point and station mode together
 #define WIFI_MAX 15
 typedef struct{
+  String mac;
   String ssid;
   int rssi;
   bool secured=0; //0 if unsecured, 1 if secured
@@ -20,21 +21,26 @@ bool scanCompleted=0; //0 if haven't complete scanning, 1 if done
  * and saving is done, it will set the scanCompleted variable, otherwise it will stay 0.
  * Note:Typically takes ~2.184s to scan and store available wifi networks
  */
+#include "painlessMesh.h"
 void scanNetwork(){
   scanCompleted=0;
   memset(availableNetworks,(char)0,WIFI_MAX);  //clears all previous wifi info
   WiFi.mode(WIFI_MODE);  //station mode = 3, access point + station
   WiFi.scanDelete();
-  Serial.println("Scanning for WiFi networks...");
+  //Serial.println("Scanning for WiFi networks...");
   WiFi.scanNetworksAsync(saveNetwork,true); //asynchronously scan for networks available(wont wait)
 }
+Task scanNodes(0,TASK_ONCE,&scanNetwork);
 void saveNetwork(int networksFound){
   int n = networksFound;  //retrieve scanned networks number
   if (n == 0)
-    Serial.println("No networks found");
+    //Serial.println("No networks found");
+    delay(1);
   else{ 
-    Serial.printf("%d networks found\n",n);
+    //Serial.printf("%d networks found\n",n);
     for(int i=0;i<n;i++){ //store wifi info while sorting
+      //availableNetworks[i].ssid=WiFi.SSID(i);
+      availableNetworks[i].mac=WiFi.BSSIDstr(i);
       availableNetworks[i].ssid=WiFi.SSID(i);
       availableNetworks[i].rssi=WiFi.RSSI(i);
       WiFi.encryptionType(i) == ENC_TYPE_NONE?  //check encryption type
@@ -49,16 +55,29 @@ void saveNetwork(int networksFound){
         }
       }
     }
+//    for(int i=0;i<n;i++){
+//      Serial.printf("%d:",i+1);
+//      Serial.print(availableNetworks[i].ssid);
+//      Serial.print("(");
+//      Serial.print(availableNetworks[i].rssi);
+//      Serial.print(")\n");
+//    }
+    Serial.print("DATA,TIME");
     for(int i=0;i<n;i++){
-      Serial.printf("%d:",i+1);
-      Serial.print(availableNetworks[i].ssid);
-      Serial.print("(");
-      Serial.print(availableNetworks[i].rssi);
-      Serial.print(")\n");
+      //if(availableNetworks[i].ssid == "Swarm_Intel"){
+      if(true){
+        Serial.print(",");
+        Serial.print(availableNetworks[i].ssid);
+        Serial.print(availableNetworks[i].mac);
+        Serial.printf(",%d",availableNetworks[i].rssi);
+      }
     }
+    Serial.print(",AUTOSCROLL_20");
   }
   Serial.println("");
   scanCompleted=1;
+  //scanNodes.disable();
+  scanNodes.restartDelayed(200);
 }
 String SELF_SSID="ESP_";
 #define SELF_PASSWORD "password"
@@ -71,8 +90,8 @@ void configureAccessPoint(){
 }
 /*End of WiFi Codes-----------------------------------------------------------*/
 /*Mesh Codes------------------------------------------------------------------*/
-#include <list>
-#include "painlessMesh.h"
+//#include <list>
+//#include "painlessMesh.h"
 #define MESH_SSID "Swarm_Intel"
 #define MESH_PASSWORD "password"
 #define MESH_PORT 5555
@@ -89,9 +108,9 @@ painlessMesh mesh;
 Task communicate(5000,TASK_FOREVER,&communicateWithNodes);
 Task self_blink_on(1000,TASK_FOREVER,&LED_ON);
 Task self_blink_off(0,TASK_ONCE,&LED_OFF);
-Task scanNodes(5000,TASK_FOREVER,&scanNetwork);
+//Task scanNodes(0,TASK_ONCE,&scanNetwork);
 Task enableTOA(1000,TASK_FOREVER,&TOAenabler);
-Task doingTOA(0,TASK_ONCE,&sendTOA);
+Task doingTOA(0,TASK_ONCE,&sendTOA2);
 
 void meshSetup(){
   mesh.setDebugMsgTypes(ERROR|STARTUP); 
@@ -100,40 +119,92 @@ void meshSetup(){
   mesh.onChangedConnections(&onChangedConnections);
   //mesh.onNodeDelayReceived(&onNodeDelayReceived);
   mesh.onNodeDelayReceived(&receiveTOA);
-  mesh.onReceive(&sync);
+  //mesh.onReceive(&sync);
+  mesh.onReceive(&receiveTOA2);
   taskScheduler.addTask(communicate);
   taskScheduler.addTask(self_blink_on);
   taskScheduler.addTask(self_blink_off);
   taskScheduler.addTask(doingTOA);
   taskScheduler.addTask(enableTOA);
-  //taskScheduler.addTask(scanNodes);
+  taskScheduler.addTask(scanNodes);
   selfNodeID = mesh.getNodeId();
   currentMaster = selfNodeID;
   addSelfToNodeList();
   pinMode(BUILTIN_LED,OUTPUT);
   //communicate.enable();
-  //scanNodes.enable();
-  enableTOA.enable();
+  scanNodes.enable();
+  //enableTOA.enable();
 }
 int TOAstarted = 0;
 void TOAenabler(){
   if(currentNodeCount>1 && TOAstarted == 0){
     doingTOA.enable();
+    Serial.println("CLEARSHEET");
+    Serial.println("LABEL,Start(us),End(us),From,To,Delta(us),Delay(us),Error(us),Topology");
     TOAstarted = 1;
   }
   else if (currentNodeCount == 1){
     TOAstarted = 0;
   }
 }
+uint32_t sendTime, receiveTime;
+void sendTOA2(){
+  DynamicJsonDocument doc(1024);
+  sendTime = mesh.getNodeTime();
+  char sendtext[5];
+  sprintf(sendtext,"%lu",sendTime);
+  doc["TOA"]=String(sendtext);
+  //Serial.println(sendtext);
+  String msg;
+  serializeJson(doc,msg);
+  mesh.sendBroadcast(msg);
+}
+void receiveTOA2(uint32_t from, String &msg){
+  uint32_t firstReceive = mesh.getNodeTime();
+  String json;
+  DynamicJsonDocument doc(1024);
+  json=msg.c_str();
+  deserializeJson(doc,json);
+  String text=doc["TOA"];
+  //Serial.println(text);
+  char text2[11];
+  text.toCharArray(text2,11);
+  receiveTime = strtoul(text2,NULL,10);
+  //Serial.println(receiveTime);
+  uint32_t delayTime = firstReceive-receiveTime;
+  //Serial.printf("%u,%u,%u\n",firstReceive,receiveTime,delayTime);
+  if(delayTime<10000){
+    Serial.printf("DATA,%u,%u,%u,%u,%u,%d,%u,",receiveTime,firstReceive,selfNodeID,from,0,delayTime,0);
+    Serial.print(mesh.subConnectionJson());
+    Serial.print(",AUTOSCROLL_20");
+    Serial.println();
+  }
+  doingTOA.restartDelayed(1000);
+}
 void sendTOA(){
   if(currentNodeCount>1 && TOAstarted == 1){
     mesh.startDelayMeas(nodeList[1]);
-    Serial.printf("Started:%uus\n",mesh.getNodeTime());  //in us
+    //Serial.printf("Started:%uus\n",mesh.getNodeTime());  //in us
+    sendTime = mesh.getNodeTime();
+    //Serial.printf("DATA,%u,",sendTime);
   }
 }
 void receiveTOA(uint32_t nodeID, int32_t nodeDelay){
-  Serial.printf("Ended:%uus\n",mesh.getNodeTime());
-  Serial.printf("From ID:%u Delay:%dus\n",nodeID,nodeDelay);
+  //Serial.printf("Ended:%uus\n",mesh.getNodeTime());
+  //Serial.printf("From ID:%u Delay:%dus\n",nodeID,nodeDelay);
+  if(nodeDelay<10000){
+    uint32_t receiveTime = mesh.getNodeTime();
+    uint32_t delta = (receiveTime-sendTime)/2;
+    uint32_t error;
+    if(delta>nodeDelay)
+      error = delta-nodeDelay;
+    else
+      error = nodeDelay-delta;
+    Serial.printf("DATA,%u,%u,%u,%u,%u,%d,%u,",sendTime,receiveTime,selfNodeID,nodeID,delta,nodeDelay,error);
+    Serial.print(mesh.subConnectionJson());
+    Serial.print(",AUTOSCROLL_20");
+    Serial.println();
+  }
   doingTOA.restartDelayed(1000);
 }
 
