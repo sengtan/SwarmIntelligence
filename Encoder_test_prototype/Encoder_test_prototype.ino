@@ -36,13 +36,14 @@ void Test_GPIO(){
 }
 /*End of TXRX Replace Code------------------------------------------------------*/
 /*Encoder Code------------------------------------------------------------------*/
+/*Tested to have <1% error when measured Tp is compared to actual Tp with lower standard deviation*/
 const uint8_t L_EN = D2;
 const uint8_t R_EN = D6;
 
 bool L_move = 0, R_move = 0;
 const int ENC_SAMPLES = 5;
 unsigned long L_timer = 0, R_timer = 0;
-int L_tp[20], R_tp[20];
+int L_tp[ENC_SAMPLES], R_tp[ENC_SAMPLES];
 float L_avgtp = 0, R_avgtp = 0;
 long L_tso = 0, R_tso = 0, L_tss = 0, R_tss = 0;
 int L_counter = 0, R_counter = 0;
@@ -69,11 +70,11 @@ void ICACHE_RAM_ATTR L_Callback(){
       L_rpm = (float)3000/L_avgtp;; //calculated rpm, 60000ms / L_avgtp ms / 20 ticks => 3000/L_avgtp 
       if(L_counter == ENC_SAMPLES)  //if L_counter reaches ENC_SAMPLES, array is full, restart from beginning
         L_counter = 0;  //reset L_counter
-      Serial.printf("L_TP:%.2fms,L_RPM:%.2f\n",L_avgtp,L_rpm);
+     //Serial.printf("L_TP:%.2fms,L_RPM:%.2f\n",L_avgtp,L_rpm);
     }
   }
   else {  //Left motor is either moved by external forces/bumped
-    
+    delay(1);
   }
  }
 }
@@ -97,6 +98,81 @@ void Encoder_Reset(){
   }
 }
 /*End of Encoder Code-----------------------------------------------------------*/
+/*Motor PID Code----------------------------------------------------------------*/
+#include<PID_v1.h>
+float Setpoint_offset = 1.5;
+float actualSetpoint = 35;
+float Setpoint = actualSetpoint, L_pidin, L_pidout, R_pidin, R_pidout;
+float Kp=7.2, Ki=0.065, Kd=0.01625; //Kcrit = 12, Pcrit = 130ms
+
+PID L_PID(&L_pidin,&L_pidout,&Setpoint,Kp,Ki,Kd,REVERSE);
+PID R_PID(&R_pidin,&R_pidout,&Setpoint,Kp,Ki,Kd,REVERSE);
+
+void PID_Setup(){
+  L_PID.SetSampleTime(10); R_PID.SetSampleTime(10); //ms
+  L_PID.SetOutputLimits(0,1023); R_PID.SetOutputLimits(0,1023); //min max
+  L_PID.SetMode(MANUAL); R_PID.SetMode(MANUAL); //MANUAL to manually reset output, AUTOMATIC to let code auto set
+}
+
+const int STEADY_SAMPLES = 4;
+const float steady_state_err = 5;  //max allowed steady state err %
+const float steady_state_value = (actualSetpoint*steady_state_err)/100.0;
+float prev_max = 0, prev_min = 100;
+float maxer[STEADY_SAMPLES], miner[STEADY_SAMPLES];
+float avg_max = 0, avg_min = 100;
+int max_counter = 0, min_counter = 0, max_samples = 0, min_samples = 0;
+bool prev_state = 0, current_state = 0, transition = 0;
+
+bool getSteadyState(float avgtp){
+  if(avgtp>Setpoint){
+    current_state = 1;
+    if(prev_max<avgtp)
+      prev_max = avgtp;
+    if(prev_state != current_state){  //transition
+      transition = 1;
+      if(min_counter == STEADY_SAMPLES) //if counter reach max
+        min_counter = 0;  //reset counter
+      miner[min_counter] = prev_min;  //store previous highest point
+      min_samples++; min_counter++;
+      avg_min = 0;
+      int i;  //declare locally to not affect other code
+      for(i=0;i<min_samples && i<STEADY_SAMPLES;i++)
+        avg_min += miner[i];  //sum up all highest point
+      avg_min = (float)avg_min/(float)i;  //determine current high point avg
+      prev_min = actualSetpoint;
+    }
+    prev_state = current_state;
+  }
+  else if(avgtp<Setpoint){
+    current_state = 0;
+    if(prev_min>avgtp)
+      prev_min = avgtp;
+    if(prev_state != current_state){  //transition
+      transition = 1;
+      if(max_counter == STEADY_SAMPLES) //if counter reach max
+        max_counter = 0;  //reset counter
+      maxer[max_counter] = prev_max;  //store previous highest point
+      max_samples++; max_counter++;
+      avg_max = 0;
+      int i;  //declare locally to not affect other code
+      for(i=0;i<max_samples && i<STEADY_SAMPLES;i++)
+        avg_max += maxer[i];  //sum up all highest point
+      avg_max = (float)avg_max/(float)i;  //determine current high point avg
+      prev_max = actualSetpoint;
+    }
+    prev_state = current_state;
+  }
+  if(transition){
+    //Wait until response signal is within +- Steady state error
+    if( (avg_max-actualSetpoint) < steady_state_value && (actualSetpoint-avg_min) < steady_state_value ){
+      //Serial.printf("Reached Steady State with Error of %f%%\n",steady_state_err);
+      return true;
+    }
+    transition = 0;
+  }
+  return false;
+}
+/*End of Motor PID Code---------------------------------------------------------*/
 /*Motor Driver Code-------------------------------------------------------------*/
 const uint8_t M1A = D7;
 const uint8_t M1B = D8;
@@ -105,10 +181,75 @@ const uint8_t M2B = D5;
 
 #define WHEEL_DIAMETER 67 //in mm
 #define WHEEL_CIRCUMFERENCE 21.049 //cm
+#define DEFAULT_SPEED 600 //600/1023
 
-Task forward(0,TASK_ONCE,&Test_Forward);
-Task rest(0,TASK_ONCE,&Test_Stop);
-Task testing(0,TASK_ONCE,&Forward);
+int L_speed, R_speed;
+
+Task PID_forward(0,TASK_ONCE,&PID_Test);
+
+void PID_Test(){  //using left wheel only
+  float avgtp; int donetime; bool done = 0;
+  L_move = 1; R_move = 1; L_avgtp = 0;
+  L_speed = DEFAULT_SPEED; R_speed = DEFAULT_SPEED;
+  L_PID.SetMode(MANUAL);  //to manually reset output
+  L_pidout = (float)L_speed;  //reset output value
+  L_PID.SetMode(AUTOMATIC); //auto again
+  digitalWrite(M1B,0); digitalWrite(M2B,0); //Should set low first before starting motors, outside loop because it doesnt change
+  donetime = millis();
+  do{
+    analogWrite(M1A,L_speed); analogWrite(M2A, R_speed); //Start motors, inside loop because speed value changes
+    if(L_tss>1){
+      avgtp=L_avgtp;
+      L_pidin = avgtp;
+      L_PID.Compute();  //Compute the output based on err/delta
+      L_speed = (int)L_pidout;  //convert float to int
+      //To see monitor, use below 1 line
+      //Serial.printf("In:%.2f,Out:%d,Delta:%.2f,Set:%.2f,\n",L_avgtp,L_speed,L_avgtp-actualSetpoint,actualSetpoint);
+      //To see plot, use below 3 lines
+      Serial.printf("40,30,%f,%f,%f,%f,%f,%f,",avg_max,avg_min,actualSetpoint,actualSetpoint+steady_state_value,actualSetpoint-steady_state_value,((float)L_speed/100)+25);
+      Serial.print(avgtp);
+      Serial.println();
+    }
+    yield();
+  }while(!getSteadyState(avgtp));
+  donetime = millis() - donetime;
+  digitalWrite(M1A,0); digitalWrite(M2A,0);
+  Serial.printf("In:%.2f,Out:%d,Delta:%.2f,Set:%.2f\n",L_avgtp,L_speed,L_avgtp-actualSetpoint,actualSetpoint);
+  Serial.printf("Total time taken:%d\n",donetime);
+  L_move = 0; L_avgtp = 0;
+}
+
+void PID_Forward(){
+  float avgtp; int donetime; bool done = 0;
+  L_move = 1; R_move = 1; L_avgtp = 0;
+  L_speed = DEFAULT_SPEED; R_speed = DEFAULT_SPEED;
+  L_PID.SetMode(MANUAL);  //to manually reset output
+  L_pidout = (float)L_speed;  //reset output value
+  L_PID.SetMode(AUTOMATIC); //auto again
+  digitalWrite(M1B,0); digitalWrite(M2B,0); //Should set low first before starting motors, outside loop because it doesnt change
+  donetime = millis();
+  do{
+    analogWrite(M1A,L_speed); analogWrite(M2A, R_speed); //Start motors, inside loop because speed value changes
+    if(L_tss>1){
+      avgtp=L_avgtp;
+      L_pidin = avgtp;
+      L_PID.Compute();  //Compute the output based on err/delta
+      L_speed = (int)L_pidout;  //convert float to int
+      //To see monitor, use below 1 line
+      //Serial.printf("In:%.2f,Out:%d,Delta:%.2f,Set:%.2f,\n",L_avgtp,L_speed,L_avgtp-actualSetpoint,actualSetpoint);
+      //To see plot, use below 3 lines
+      Serial.printf("40,30,%f,%f,%f,%f,%f,%f,",avg_max,avg_min,actualSetpoint,actualSetpoint+steady_state_value,actualSetpoint-steady_state_value,((float)L_speed/100)+27);
+      Serial.print(avgtp);
+      Serial.println();
+    }
+    yield();
+  }while(!getSteadyState(avgtp) || true);
+  donetime = millis() - donetime;
+  digitalWrite(M1A,0); digitalWrite(M2A,0);
+  Serial.printf("In:%.2f,Out:%d,Delta:%.2f,Set:%.2f\n",L_avgtp,L_speed,L_avgtp-actualSetpoint,actualSetpoint);
+  Serial.printf("Total time taken:%d\n",donetime);
+  L_move = 0; L_avgtp = 0;
+}
 
 void Test_Stop(){
   digitalWrite(M2A,0);
@@ -118,7 +259,7 @@ void Test_Stop(){
   L_move = 0; R_move = 0;
   Encoder_Reset();
   Serial.println("STOP");
-  forward.restartDelayed(1000);
+  //forward.restartDelayed(1000);
 }
 void Motor_Setup(){
   pinMode(M1A,OUTPUT);
@@ -153,15 +294,6 @@ void Forward(){ //in cm
     digitalWrite(M1B,0);
   }
   Serial.println("DONE");
-}
-void Test_Forward(){
-  L_move = 1; R_move = 1;
-  Serial.println("MOVE");
-  analogWrite(M1A,600);
-  digitalWrite(M1B,0);
-  analogWrite(M2A,600);
-  digitalWrite(M2B,0);
-  rest.restartDelayed(1000);
 }
 void Test_Left(){
   analogWrite(M1A,600);
@@ -205,11 +337,12 @@ void Test_Right(){
 #define R3 100  //built-in resistor in k
 #define R4 220  //built-in resistor in k
 #define NODEMCU_VOLT 3.33
+#define BATTERY_CONSTANT 0.228
 const uint8_t BAT_IN = A0;  //set Battery input pin
 void Read_Battery(){
   int analogInput = analogRead(BAT_IN);
   float A0_voltage = ((float)analogInput/1023)*NODEMCU_VOLT; //convert into 3.3V range
-  float BAT_voltage = A0_voltage/0.377;  //convert into 8.4V range
+  float BAT_voltage = (A0_voltage/0.377)-BATTERY_CONSTANT;  //convert into 8.4V range, then deduct by 0.228V constant due to error
   float BAT_percent = (BAT_voltage/8.4)*100;
   Serial.printf("raw:%d,A0:%.2f,BAT:%.2f,Prcnt:%.2f%%\n",analogInput,A0_voltage,BAT_voltage,BAT_percent);
 }
@@ -221,17 +354,15 @@ const uint8_t scl = D1;
 const uint8_t sda = D3;
 
 Scheduler taskScheduler;
-
+int donetime = 0;
 void setup() {
   Serial.begin(115200);
   Wire.begin(sda, scl);
-  taskScheduler.addTask(forward);
-  taskScheduler.addTask(rest);
-  taskScheduler.addTask(testing);
-  Motor_Setup();
+  taskScheduler.addTask(PID_forward);
   Encoder_setup();
-  //forward.enable();
-  testing.enable();
+  Motor_Setup();
+  PID_Setup();
+  PID_forward.restartDelayed(1000);
 }
 
 void loop() {
