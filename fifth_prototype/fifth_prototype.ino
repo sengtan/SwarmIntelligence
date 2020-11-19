@@ -1,0 +1,2092 @@
+/*Control Panel---------------------------------------------------------------*/
+/*Libraries*/
+//ESP8266 Library
+#include <ESP8266WiFi.h>
+
+//Async Server & WebSocket Library
+#include "IPAddress.h"
+#include "Hash.h"
+#include <ESPAsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <WebSocketsServer.h>
+
+//Mesh Library
+#include <list>
+#include "painlessMesh.h"
+
+//QMC5883L Library
+#include <QMC5883L.h>
+#include <Wire.h>
+
+//FUSION/MPU6050 Library
+#include "Kalman.h"
+
+//PID Library
+#include<PID_v1.h>
+
+/*Control Variables*/
+//Serial Controls
+#define SERIAL      1       //for configuring Serial on or off  
+#define SERIAL_GPIO 0       //to set Tx, Rx pin as GPIOs        
+
+//I2C Controls
+#define I2C_COM     1       //for enabling I2C on SDA (D3), SCL (D1)  
+
+//WIFI Controls
+#define WIFISCANNER 1       //for enabling WIFI signal scanning 
+#define WIFIAPMODE  0       //for configuring own access point  
+
+//Async Server & WebSocket Controlsrpm
+#define ASYNCSERVER 0       //for setup of AsyncWebServer
+#define WEBSOCKET   0       //for setup of WebSocket
+
+//Mesh Controls
+#define MESHNETWORK 1       //for setup of Mesh network z
+#define ROOT "807D3A235911" //specify who is root (MAC)
+#define ROOTID 975395089    //specify root ID
+bool isROOT = 0;
+
+//Battery Controls
+#define BATTERYREADER   0   //for detecting battery voltage & percent z
+
+//QMC5883L Controls
+#define QMC5883LMODULE  1   //for setup of compass module
+#define QMC5883LPRINT   0   //for printing out values
+#define QMC_MANUAL_CAL  0   //specify if manual calibration set
+#define QMC_AUTO_CAL    1   //specify if robot calibrates itself by rotating
+
+//MPU6050 Controls
+#define MPU6050MODULE   1   //for setup of MPU6050 module
+#define MPU6050PRINT    0   //for printing out values
+
+//Sensor Fusion Controls
+#define FUSION          1   //for setup of fusion data for MPU6050 and QMC5883L
+#define FUSIONPRINT     0   //for printing out values
+#define FUSIONRAW       1   //to output raw data
+#define FUSIONTILT      1   //to calculate data compensated with tilt
+#define FUSIONCOMP      1   //to calculate data using complementary filter
+#define FUSIONKALMAN    1   //to calculate data using kalman filter
+#define FUSIONTEMP      0   //to use temporary YAW during movement
+
+//Encoder Controls
+#define ENCODER_L 1         //for enabling Left encoder on pin D2   z
+#define ENCODER_R 1         //for enabling Right encoder on pin D6  z
+
+//PID Controls
+#define PID_CONTINUOUS  1   //for testing PID algorithm on continuous wheel
+
+//Motor Controls
+#define MOTOR_CONTROL_L 1   //for enabling/disabling left motor
+#define MOTOR_CONTROL_R 1   //for enabling/disabling right motor
+#define STARTUP_NORTH   1   //to auto turn to North on startup
+
+//Bump Button Controls
+#define BUMP_L  1           //for enabling bump sensor on D4  z
+#define BUMP_R  0           //for enabling bump sensor on TX  z
+#define BUMP_B  1           //for enabling bump sensor on D0  z
+
+/*Global Variables*/
+#define M_PI 3.14159265358979323846264338327950288
+Scheduler taskScheduler;
+
+volatile int step_counter = 0;
+volatile bool getBattery = 0;
+volatile bool getQMC5883L = 0;
+volatile bool getMPU6050 = 0;
+volatile bool getFusion = 0;
+volatile bool startScan = 0;
+volatile bool getScan = 0;
+/*End of Control Panel--------------------------------------------------------*/
+/*Replace TXRX pins Code------------------------------------------------------*/
+const uint8_t TX = 1; //GPIO1 (TX)
+const uint8_t RX = 3; //GPIO3 (RX)
+
+void TXRX_to_GPIO() {
+  pinMode(TX, FUNCTION_3);
+  pinMode(RX, FUNCTION_3);
+}
+void TXRX_to_DEFAULT() {
+  pinMode(TX, FUNCTION_0);
+  pinMode(RX, FUNCTION_0);
+}
+/*End of TXRX Replace Code----------------------------------------------------*/
+/*Battery Voltage Reader Code-------------------------------------------------*/
+/* The battery voltage passes through a voltage divider circuit of:
+   V_A0 = V_BAT (R1/R1+R2)
+   Where
+   R1 = 10k ohm
+   R2 = 16k ohm
+   V_BAT = 8.4V(max) or 7.4V(nominal)
+   V_A0 = 3.231V(max) or 2.846V(nominal)
+   Note: Battery voltage input is also connected to Buck converter input
+   CRITICAL EDIT:
+   Since NodeMCU already has a fixed built-in voltage divider of
+   Node_A0 = V_A0 (R3/R3+R4)
+   Where
+   R3 = 100k ohm
+   R4 = 220k ohm
+   The addition of another voltage divider from above has caused some changes,
+   V_A0 = 0.377(V_BAT)
+   Node_A0 = 0.3125(V_A0)
+           = 0.1178(V_BAT)
+   Thus, the concluded expected voltages are:
+   V_BAT = 8.4V(max) or 7.4V(nominal)
+   V_A0 = 3.167V(max) or 2.789(nominal)   //0.377 V_BAT
+   Node_A0 = 0.989V(max) or 0.872V(nominal) //0.3125*0.377 V_BAT
+*/
+#define R1 10 //external resistor in k
+#define R2 16 //external resistor in k
+#define R3 100  //built-in resistor in k
+#define R4 220  //built-in resistor in k
+#define NODEMCU_VOLT 3.33
+#define BATTERY_CONSTANT 0.228
+
+const uint8_t BAT_IN = A0;  //set Battery input pin
+
+float BAT_voltage, BAT_percent;
+
+void BATTERY_read();
+Task readBattery(1000, TASK_FOREVER, &BATTERY_read);
+
+void BATTERY_Setup() {
+  if (BATTERYREADER) {
+    taskScheduler.addTask(readBattery);
+    readBattery.enable();
+  }
+}
+void BATTERY_read() {
+  int analogInput = analogRead(BAT_IN);
+  float A0_voltage = ((float)analogInput / 1023) * NODEMCU_VOLT; //convert into 3.3V range
+  BAT_voltage = (A0_voltage / 0.377); //convert into 8.4V range
+  if (BAT_voltage > BATTERY_CONSTANT)
+    BAT_voltage -= BATTERY_CONSTANT;  //then deduct by 0.228V constant due to error
+  BAT_percent = (BAT_voltage / 8.4) * 100; //convert into percentage
+  Serial.printf("raw:%d,A0:%.2f,BAT:%.2f,Prcnt:%.2f%%\n", analogInput, A0_voltage, BAT_voltage, BAT_percent);
+  getBattery = 1; //to signify done
+}
+/*End of Battery Votlage Reader Code------------------------------------------*/
+/*Path Loss Model Code--------------------------------------------------------*/
+/* The estimated distance is calculated based on RSSI using a modified version of
+   Solah's model, which adds in a constant of -3 based on compiled test results.
+   The RSSI calculation assumes signal travels in LOS, indoors.
+   Seng's (modified Solah's) = PLo + 10*n*log_10(d) + (-3)
+   d = 10^( (RSSI-PLo-(-3)) / (10*n) )
+   Note: The input, targetRSSI should be in -dBm
+*/
+const float PLo = 50.667;
+const float PLn = 2.667;
+const float PLc = -3;
+
+float PL_calcDistance(float targetRSSI) {
+  float distance;
+  distance = (targetRSSI - PLo - PLc); //(RSSI-PLo-(-3) part
+  distance = distance / (10 * PLn); //divide previous by (10*n)
+  distance = pow(10, distance);     //10 power of previous result
+  return distance;
+}
+/*End of Path Loss Model Code-------------------------------------------------*/
+/*QMC5883L Codes--------------------------------------------------------------*/
+#define MAG_CAL_PERIOD 15000  // 15000ms, 15sec
+QMC5883L compass;
+
+int16_t MagX, MagY, MagZ, Xmax, Xmin, Ymax, Ymin, Zmax, Zmin;
+float Xoffset, Yoffset, Zoffset, declinationAngle = 0;
+float rawHeading = 0;
+uint32_t QMC5883L_timer;
+bool RightHemis = 1;  //initially turn to north, then move to right hemisphere to check
+
+void QMC5883L_print();
+Task readCompass(10, TASK_FOREVER, &QMC5883L_read);
+Task printCompass(10, TASK_FOREVER, &QMC5883L_print);
+
+void QMC5883L_Setup() {
+  if (QMC5883LMODULE) {
+    declinationAngle = (0.0 - (19.0 / 60.0) / (180.0 / M_PI)); //calculate declination
+    compass.init();
+    if (QMC_MANUAL_CAL) {   //if manual set calibration
+      compass.setCalibration(3710, -5240, 6042, -5175);
+    }
+    else if (QMC_AUTO_CAL) { //robot auto rotate to calibrate
+      QMC5883L_autocalibrate();
+    }
+    else {                  //manually calibrate by moving the robot
+      QMC5883L_calibrate();
+    }
+    if (!FUSION && QMC5883LMODULE && QMC5883LPRINT) {
+      if (QMC5883LPRINT) {
+        taskScheduler.addTask(printCompass);
+        printCompass.enable();
+      }
+      else {
+        taskScheduler.addTask(readCompass);
+        readCompass.enable();
+      }
+    }
+  }
+}
+void QMC5883L_read() {     //retrieve data and store in variables
+  rawHeading = compass.readHeading();
+  compass.readRaw(&MagX, &MagY, &MagZ);
+  compass.readCalFull(&Xmax, &Xmin, &Ymax, &Ymin, &Zmax, &Zmin);
+  Xoffset = (float)(Xmax + Xmin) / 2;
+  Yoffset = (float)(Ymax + Ymin) / 2;
+  Zoffset = (float)(Zmax + Zmin) / 2;
+  MagX = MagX - Xoffset;
+  MagY = MagY - Yoffset;
+  MagZ = MagZ - Zoffset;
+  getQMC5883L = 1; //to signify done
+}
+void QMC5883L_print() { //data not fused with MPU6050
+  QMC5883L_read();
+  Serial.printf("H:%f,", rawHeading);
+  Serial.printf("X:%d,x:%d,", Xmax, Xmin);
+  Serial.printf("Y:%d,y:%d,", Ymax, Ymin);
+  Serial.printf("Z:%d,z:%d\n", Zmax, Zmin);
+  Serial.println();
+}
+void QMC5883L_calibrate() { //adjust for soft/hard iron
+  QMC5883L_timer = millis();
+  while ( (millis() - QMC5883L_timer) < MAG_CAL_PERIOD) { //calibrate manually 15 sec
+    QMC5883L_read();
+    Serial.printf("X:%d,x:%d,Y:%d,y:%d,Z:%d,z:%d\n", Xmax, Xmin, Ymax, Ymin, Zmax, Zmin);
+    yield();
+  }
+}
+void PID_Cali_Rotate();
+void QMC5883L_autocalibrate(){
+  PID_Cali_Rotate();
+}
+/*End of QMC5883L Codes-------------------------------------------------------*/
+/*MPU6050 Code----------------------------------------------------------------*/
+// MPU6050 Slave Device Address
+const uint8_t MPU6050SlaveAddress = 0x68;
+
+// sensitivity scale factor respective to full scale setting provided in datasheet
+const uint16_t AccelScaleFactor = 16384;
+const uint16_t GyroScaleFactor = 131;
+
+// MPU6050 few configuration register addresses
+const uint8_t MPU6050_REGISTER_SMPLRT_DIV   =  0x19;
+const uint8_t MPU6050_REGISTER_USER_CTRL    =  0x6A;
+const uint8_t MPU6050_REGISTER_PWR_MGMT_1   =  0x6B;
+const uint8_t MPU6050_REGISTER_PWR_MGMT_2   =  0x6C;
+const uint8_t MPU6050_REGISTER_CONFIG       =  0x1A;
+const uint8_t MPU6050_REGISTER_GYRO_CONFIG  =  0x1B;
+const uint8_t MPU6050_REGISTER_ACCEL_CONFIG =  0x1C;
+const uint8_t MPU6050_REGISTER_FIFO_EN      =  0x23;
+const uint8_t MPU6050_REGISTER_INT_ENABLE   =  0x38;
+const uint8_t MPU6050_REGISTER_ACCEL_XOUT_H =  0x3B;
+const uint8_t MPU6050_REGISTER_SIGNAL_PATH_RESET  = 0x68;
+
+int16_t AccelX, AccelY, AccelZ, Temperature, GyroX, GyroY, GyroZ;
+float Ax, Ay, Az, T, Gx, Gy, Gz;
+
+Task readMPU(10, TASK_FOREVER, &MPU6050_read);
+Task printMPU(10, TASK_FOREVER, &MPU6050_print);
+
+void I2C_Write(uint8_t deviceAddress, uint8_t regAddress, uint8_t data) {
+  Wire.beginTransmission(deviceAddress);
+  Wire.write(regAddress);
+  Wire.write(data);
+  Wire.endTransmission();
+}
+void MPU6050_Setup() {
+  if (MPU6050MODULE) {
+    delay(150); //let module settle down first
+    I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_SMPLRT_DIV, 0x07);
+    I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_PWR_MGMT_1, 0x01);
+    I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_PWR_MGMT_2, 0x00);
+    I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_CONFIG, 0x00);
+    I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_GYRO_CONFIG, 0x00);//set +/-250 degree/second full scale
+    I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_ACCEL_CONFIG, 0x00);// set +/- 2g full scale
+    I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_FIFO_EN, 0x00);
+    I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_INT_ENABLE, 0x01);
+    I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_SIGNAL_PATH_RESET, 0x00);
+    I2C_Write(MPU6050SlaveAddress, MPU6050_REGISTER_USER_CTRL, 0x00);
+  }
+  if (!FUSION && MPU6050MODULE) {
+    if (MPU6050PRINT) {
+      taskScheduler.addTask(printMPU);
+      printMPU.enable();
+    }
+    else {
+      taskScheduler.addTask(readMPU);
+      readMPU.enable();
+    }
+  }
+}
+void MPU6050_readRaw(uint8_t deviceAddress, uint8_t regAddress) {
+  Wire.beginTransmission(deviceAddress);
+  Wire.write(regAddress);
+  Wire.endTransmission();
+  Wire.requestFrom(deviceAddress, (uint8_t)14);
+  AccelX = (((int16_t)Wire.read() << 8) | Wire.read());
+  AccelY = (((int16_t)Wire.read() << 8) | Wire.read());
+  AccelZ = (((int16_t)Wire.read() << 8) | Wire.read());
+  Temperature = (((int16_t)Wire.read() << 8) | Wire.read());
+  GyroX = (((int16_t)Wire.read() << 8) | Wire.read());
+  GyroY = (((int16_t)Wire.read() << 8) | Wire.read());
+  GyroZ = (((int16_t)Wire.read() << 8) | Wire.read());
+}
+void MPU6050_read() {
+  MPU6050_readRaw(MPU6050SlaveAddress, MPU6050_REGISTER_ACCEL_XOUT_H);
+
+  Ax = (float)AccelX / AccelScaleFactor;
+  Ay = (float)AccelY / AccelScaleFactor;
+  Az = (float)AccelZ / AccelScaleFactor;
+  T  = (float)Temperature / 340 + 36.53; //temperature formula
+  Gx = (float)GyroX / GyroScaleFactor;
+  Gy = (float)GyroY / GyroScaleFactor;
+  Gz = (float)GyroZ / GyroScaleFactor;
+  getMPU6050 = 1;
+  MPU6050_checkbump();
+}
+void MPU6050_print() {
+  MPU6050_read();
+//  Serial.printf("Ax:%f,Ay:%f,Az:%f\n", Ax, Ay, Az);
+//  Serial.printf("T:%f,", T);
+//  Serial.printf("Gx:%f,Gy:%f,Gz:%f\n", Gx, Gy, Gz);
+}
+void MPU6050_checkbump() {
+  float yAxis = (float) Ay * (-1.0);
+  float magnitude = sqrt(Ax*Ax + yAxis*yAxis);
+  float angle = atan(yAxis/Ax)*57.2958;
+  if(angle <0){
+    angle = 360.0 + angle;
+  }
+  if(magnitude >= 2){
+    Serial.printf("Mag:% 4.2f, angle: % 4.2f\n",magnitude,angle);
+    Serial.println(yAxis);
+  }
+}
+/*End of MPU6050 Code---------------------------------------------------------*/
+/*Sensor Fusion Code----------------------------------------------------------*/
+Kalman kalmanX, kalmanY, kalmanZ; // Create the Kalman instances
+
+float tiltHeading;
+float AngleX, AngleY, AngleZ;
+float compAngleX, compAngleY, compAngleZ;
+float kalAngleX, kalAngleY, kalAngleZ;
+float roll, pitch, yaw;
+float estAngleZrate, estHeading, estDrift, maxDrift, posOffset, negOffset;
+
+uint32_t FUSION_timer, TEMP_timer;
+
+Task readFUSION(10, TASK_FOREVER, &FUSION_read);
+Task printFUSION(10, TASK_FOREVER, &FUSION_print);
+
+void FUSION_Setup() {
+  if (FUSION && QMC5883LMODULE && MPU6050MODULE) {
+    QMC5883L_read();
+    MPU6050_read();
+    updatePitchRoll();
+    updateYaw();
+
+    kalmanX.setAngle(roll);
+    AngleX = roll;
+    compAngleX = roll;
+
+    kalmanY.setAngle(pitch);
+    AngleY = pitch;
+    compAngleY = pitch;
+
+    kalmanZ.setAngle(yaw);
+    AngleZ = yaw;
+    compAngleZ = yaw;
+
+    if (FUSIONTEMP) {
+      measureDrift();
+    }
+    FUSION_timer = micros();
+    TEMP_timer = micros();
+    if (FUSION) {
+      if (FUSIONPRINT) {
+        taskScheduler.addTask(printFUSION);
+        printFUSION.enable();
+      }
+      else {
+        taskScheduler.addTask(readFUSION);
+        readFUSION.enable();
+      }
+    }
+  }
+}
+void FUSION_read() {
+  QMC5883L_read();
+  MPU6050_read();
+
+  float dt = (float)(micros() - FUSION_timer) / 1000000; // Calculate delta time
+  FUSION_timer = micros();
+
+  updatePitchRoll();
+  float AngleXrate = Gx / 131.0;
+  float AngleYrate = Gy / 131.0;
+
+  // This fixes the transition problem when the accelerometer angle jumps between -180 and 180 degrees
+  if ((roll < -90 && kalAngleX > 90) || (roll > 90 && kalAngleX < -90)) {
+    kalmanX.setAngle(roll);
+    AngleX = roll;
+    compAngleX = roll;
+    kalAngleX = roll;
+  } else
+    kalAngleX = kalmanX.getAngle(roll, AngleXrate, dt); // Calculate the angle using a Kalman filter
+
+  if (abs(kalAngleX) > 90)
+    AngleYrate = -AngleYrate; // Invert rate, so it fits the restricted accelerometer reading
+  kalAngleY = kalmanY.getAngle(pitch, AngleYrate, dt);
+
+  updateYaw();
+  float AngleZrate = AngleZ / 131.0;
+
+  if ((yaw < -90 && kalAngleZ > 90) || (yaw > 90 && kalAngleZ < -90)) {
+    kalmanZ.setAngle(yaw);
+    AngleZ = yaw;
+    compAngleZ = yaw;
+    kalAngleZ = yaw;
+  } else
+    kalAngleZ = kalmanZ.getAngle(yaw, AngleZrate, dt); // Calculate the angle using a Kalman filter
+
+  AngleXrate += AngleXrate * dt;
+  AngleYrate += AngleYrate * dt;
+  AngleZrate += AngleZrate * dt;
+
+  compAngleX = 0.93 * (compAngleX + AngleXrate * dt) + 0.07 * roll; // Calculate the angle using a Complimentary filter
+  compAngleY = 0.93 * (compAngleY + AngleYrate * dt) + 0.07 * pitch;
+  compAngleZ = 0.93 * (compAngleZ + AngleZrate * dt) + 0.07 * yaw;
+
+  // Reset the gyro angles when they has drifted too much
+  if (AngleX < -180 || AngleX > 180)
+    AngleX = kalAngleX;
+  if (AngleY < -180 || AngleY > 180)
+    AngleY = kalAngleY;
+  if (AngleZ < -180 || AngleZ > 180)
+    AngleZ = kalAngleZ;
+
+  rawHeading = noTiltCompensate();
+  tiltHeading = tiltCompensate();
+
+  if (tiltHeading == -1000)
+    tiltHeading = rawHeading;
+
+  rawHeading -= declinationAngle;
+  tiltHeading -= declinationAngle;
+
+  rawHeading = correctAngle(rawHeading);
+  tiltHeading = correctAngle(tiltHeading);
+
+  rawHeading = rawHeading * 180 / M_PI;
+  tiltHeading = tiltHeading * 180 / M_PI;
+
+  if (FUSIONTEMP) {
+    FUSION_tempyaw();
+  }
+  getFusion = 1; //to signify done
+}
+void FUSION_tempyaw() {
+  MPU6050_read();
+  float dt = (float)(micros() - TEMP_timer) / 1000000; // Calculate delta time
+  TEMP_timer = micros();
+  estAngleZrate = Gz / 131.0;
+  estAngleZrate += estAngleZrate * dt;
+  if ((floorf(estAngleZrate * 100) / 100) > 0 && estAngleZrate > maxDrift) { //if maxDrift is positive, estAngleZ>0 & >max, then will be true, if negative, if >0 then true
+    estHeading += (((floorf(estAngleZrate * 100) / 100) + posOffset + 0.1) * dt);
+  }
+  else if ((ceilf(estAngleZrate * 100) / 100) < 0 && estAngleZrate < maxDrift) { //if maxDrift is positive, angleZ<0 then true, if negative, angleZ<0 & <max then true
+    estHeading += (((ceilf(estAngleZrate * 100) / 100) + negOffset - 0.1) * dt);
+  }
+}
+void FUSION_print() {
+  FUSION_read();
+  if (FUSIONRAW) {
+    Serial.printf("% d,% d,% d,% 4.2f,", MagX, MagY, MagZ, rawHeading);
+  }
+  if (FUSIONTILT) {
+    Serial.printf("% 4.2f,% 4.2f,% 4.2f,% 4.2f,", Ax, Ay, Az, tiltHeading);
+  }
+  if (FUSIONCOMP) {
+    Serial.printf("% 4.2f,% 4.2f,% 4.2f,", compAngleX, compAngleY, compAngleZ);
+  }
+  if (FUSIONKALMAN) {
+    Serial.printf("% 4.2f,% 4.2f,% 4.2f,", kalAngleX, kalAngleY, kalAngleZ);
+  }
+  if (FUSIONTEMP) {
+    Serial.printf("% 4.2f,% 4.2f,", estAngleZrate, estHeading);
+  }
+  Serial.println();
+}
+void updatePitchRoll() {
+  roll = atan2(Ax, Az) * RAD_TO_DEG;
+  pitch = atan(-Ax / sqrt(Ay * Ay + Az * Az)) * RAD_TO_DEG;
+}
+void updateYaw() {
+  float rollAngle = kalAngleX * DEG_TO_RAD;
+  float pitchAngle = kalAngleY * DEG_TO_RAD;
+
+  float fy = MagZ * sin(rollAngle) - MagY * cos(rollAngle);
+  float fx = MagX * cos(pitchAngle) + MagY * sin(pitchAngle) * sin(rollAngle) + MagZ * sin(pitchAngle) * cos(rollAngle);
+  yaw = atan2(-fy, fx) * RAD_TO_DEG;
+  yaw *= -1;
+}
+float noTiltCompensate() {
+  float fx, fy;
+  fx = (float)MagX / (Xmax - Xmin);
+  fy = (float)MagY / (Ymax - Ymin);
+  float heading = atan2(fy, fx);
+  return heading;
+}
+float tiltCompensate() {
+  roll = asin(Ay);
+  pitch = asin(-Ax);
+
+  if (roll > 0.78 || roll < -0.78 || pitch > 0.78 || pitch < -0.78)
+  {
+    return -1000;
+  }
+
+  float cosRoll = cos(roll);
+  float sinRoll = sin(roll);
+  float cosPitch = cos(pitch);
+  float sinPitch = sin(pitch);
+
+  float Xh = MagX * cosPitch + MagZ * sinPitch;
+  float Yh = MagX * sinRoll * sinPitch + MagY * cosRoll - MagZ * sinRoll * cosPitch;
+
+  float heading = atan2(Yh, Xh);
+
+  return heading;
+}
+float correctAngle(float heading)
+{
+  if (heading < 0) {
+    heading += 2 * PI;
+  }
+  if (heading > 2 * PI) {
+    heading -= 2 * PI;
+  }
+
+  return heading;
+}
+void measureDrift() {
+  float cumulatedDrift;
+  estDrift = Gz / 131.0;
+  maxDrift = 0;
+  uint32_t FUSION_stopwatch = millis();
+  FUSION_timer = micros();
+  int i = 0;
+  while (i < 100) { //total required 1 sec
+    if (millis() - FUSION_stopwatch > 10) {
+      float dt = (float)(micros() - FUSION_timer) / 1000000; // Calculate delta time
+      estDrift = Gz / 131.0;
+      estDrift += estDrift * dt;
+      if (fabs(estDrift) > maxDrift) {
+        maxDrift = fabs(estDrift);
+      }
+      cumulatedDrift += estDrift;
+      FUSION_timer = micros();
+      i++;
+    }
+    yield();
+  }
+  estDrift = (float)cumulatedDrift / i;
+  maxDrift *= 1.5;
+  if (estDrift < 0) {
+    maxDrift *= -1;
+    posOffset = fabs(maxDrift);
+    negOffset = fabs(maxDrift) / 2;
+  }
+  else {
+    posOffset = fabs(maxDrift) / 2;
+    negOffset = fabs(maxDrift);
+  }
+}
+/*End of Sensor Fusion Code---------------------------------------------------*/
+/*Encoder Code----------------------------------------------------------------*/
+/*Tested to have <1% error when measured Tp is compared to actual Tp with lower standard deviation*/
+#define debounceVal 15 //ms
+
+const uint8_t L_EN = D2;
+const uint8_t R_EN = D6;
+
+volatile unsigned long L_micros = 0, R_micros = 0; //for managing debounce
+bool  L_move = 0, R_move = 0;
+const int ENC_SAMPLES = 5;
+unsigned long L_timer = 0, R_timer = 0;
+int   L_tp[ENC_SAMPLES], R_tp[ENC_SAMPLES];
+volatile float L_avgtp = 0, R_avgtp = 0;  //volatile because can change in interrupt
+volatile long  L_tso = 0, R_tso = 0, L_tss = 0, R_tss = 0;
+long  L_tsg = 0, R_tsg = 0;
+int   L_counter = 0, R_counter = 0;
+float L_rpm = 0, R_rpm = 0;
+
+void ICACHE_RAM_ATTR L_Callback() {
+  if ((long)(micros() - L_micros) >= debounceVal * 1000) {
+    if (digitalRead(L_EN)) { //check if L_EN pin is high
+      if (L_move) { //if Left motor is controlled by NodeMCU to move
+        if (L_tss == 0) { //if tick since stop is 0, this is the first tick, not counted because motor stopped for long periods
+          //L_avgtp = millis() - L_avgtp;
+          L_timer = millis(); //reset timer for tick
+          L_tss++;  //1 tick and above means that motor is moving
+        }
+        else { //1 tick and above
+          L_tp[L_counter] = millis() - L_timer; //calculate period between ticks
+          L_timer = millis(); //reset timer for tick
+          L_avgtp = 0;  //reset previous avg period
+          L_counter++; L_tss++; //L_tso++;  //increment, L_counter is for n sample of array, L_tss is to count tick since stop, L_tso is tick since on
+          int i;  //local variable, so as to not disrupt other functions
+          for (i = 0; i < (L_tss - 1) && i < ENC_SAMPLES; i++) { //L_tss-1 because first tick doesn't count, ENC_SAMPLES is max sample to store
+            L_avgtp += L_tp[i]; //add up all existing samples, if there is only 1 sample, L_tss = 2, (L_tss-1) is >= ENC_SAMPLES after 5+1 ticks
+          }
+          L_avgtp = (float)L_avgtp / i; //take accumulated period and divide by i(number of samples added up) to get average period
+          L_rpm = (float)3000 / L_avgtp;; //calculated rpm, 60000ms / L_avgtp ms / 20 ticks => 3000/L_avgtp
+          if (L_counter == ENC_SAMPLES) //if L_counter reaches ENC_SAMPLES, array is full, restart from beginning
+            L_counter = 0;  //reset L_counter
+          //Serial.printf("L_TP:%.2fms,L_RPM:%.2f\n",L_avgtp,L_rpm);
+        }
+      }
+      else {  //Left motor is either moved by external force, or leftover momentum after stopped
+        L_tsg++;
+      }
+      L_tso++;  //accumulate ticks since on for dead reckoning positioning
+    }
+    L_micros = micros();
+  }
+}
+void ICACHE_RAM_ATTR R_Callback() {
+  if ((long)(micros() - R_micros) >= debounceVal * 1000) {
+    if (digitalRead(R_EN)) { //check if R_EN pin is high
+      if (R_move) { //if Right motor is controlled by NodeMCU to move
+        if (R_tss == 0) { //if tick since stop is 0, this is the first tick, not counted because motor stopped for long periods
+          R_timer = millis(); //reset timer for tick
+          R_tss++;  //1 tick and above means that motor is moving
+        }
+        else { //1 tick and above
+          R_tp[R_counter] = millis() - R_timer; //calculate period between ticks
+          R_timer = millis(); //reset timer for tick
+          R_avgtp = 0;  //reset previous avg period
+          R_counter++; R_tss++; //R_tso++;  //increment, R_counter is for n sample of array, R_tss is to count tick since stop, R_tso is tick since on
+          int i;  //local variable, so as to not disrupt other functions
+          for (i = 0; i < (R_tss - 1) && i < ENC_SAMPLES; i++) { //L_tss-1 because first tick doesn't count, ENC_SAMPLES is max sample to store
+            R_avgtp += R_tp[i]; //add up all existing samples, if there is only 1 sample, R_tss = 2, (R_tss-1) is >= ENC_SAMPLES after 5+1 ticks
+          }
+          R_avgtp = (float)R_avgtp / i; //take accumulated period and divide by i(number of samples added up) to get average period
+          R_rpm = (float)3000 / R_avgtp;; //calculated rpm, 60000ms / R_avgtp ms / 20 ticks => 3000/R_avgtp
+          if (R_counter == ENC_SAMPLES) //if R_counter reaches ENC_SAMPLES, array is full, restart from beginning
+            R_counter = 0;  //reset R_counter
+          //Serial.printf("R_TP:%.2fms,R_RPM:%.2f\n",R_avgtp,R_rpm);
+        }
+      }
+      else {  //Right motor is either moved by external force, or leftover momentum after stopped
+        R_tsg++;
+      }
+      R_tso++;  //accumulate ticks since on for dead reckoning positioning
+    }
+    R_micros = micros();
+  }
+}
+void ENCODER_Setup() {
+  if (ENCODER_L) {
+    pinMode(L_EN, INPUT);
+    attachInterrupt(digitalPinToInterrupt(L_EN), L_Callback, RISING);
+  }
+  if (ENCODER_R) {
+    pinMode(R_EN, INPUT);
+    attachInterrupt(digitalPinToInterrupt(R_EN), R_Callback, RISING);
+  }
+}
+void ENCODER_reset() {
+  L_counter = 0;  R_counter = 0;  //Reset counter for array
+  L_avgtp = 0; R_avgtp = 0; //Reset average tp, only use avgtp after tss>=2
+  L_tss = 0;  R_tss = 0;  //Reset tick since stop
+  L_tsg = 0;  R_tsg = 0;  //Reset tick since go
+  for (int i = 0; i < ENC_SAMPLES; i++) {
+    L_tp[i] = 0;  R_tp[i] = 0;  //Reset whole array
+  }
+}
+/*End of Encoder Code---------------------------------------------------------*/
+/*Bump Button Code------------------------------------------------------------*/
+const uint8_t L_BUT = D4;
+const uint8_t R_BUT = TX;
+const uint8_t B_BUT = D0;
+volatile unsigned long L_b_micros = 0, R_b_micros = 0, B_b_micros; //for managing debounce
+volatile bool  L_bumped = 0, R_bumped = 0, B_bumped = 0, F_bumped = 0;
+
+Task PID_B_left(0, TASK_ONCE, &PID_B_Left);
+Task PID_B_right(0, TASK_ONCE, &PID_B_Right);
+Task PID_B_front(0, TASK_ONCE, &PID_B_Front);
+Task PID_B_back(0, TASK_ONCE, &PID_B_Back);
+
+void clearLocate();
+void ICACHE_RAM_ATTR L_Bump() {
+  if ((long)(micros() - L_b_micros) >= debounceVal * 1000) {
+    if(digitalRead(L_BUT) && digitalRead(R_BUT)){
+      F_bumped = 1;
+      PID_B_front.restart();
+    }
+    else{
+      L_bumped = 1;
+      PID_B_left.restart();
+    }
+    L_b_micros = micros();
+    step_counter = 0;
+  }
+}
+void ICACHE_RAM_ATTR R_Bump() {
+  if ((long)(micros() - R_b_micros) >= debounceVal * 1000) {
+    if(digitalRead(L_BUT) && digitalRead(R_BUT)){
+      F_bumped = 1;
+      PID_B_front.restart();
+    }
+    else{
+      R_bumped = 1;
+      PID_B_right.restart();
+    }
+    R_b_micros = micros();
+    step_counter = 0;
+  }
+}
+void B_Bump() {
+  if (BUMP_B) {
+    if (digitalRead(B_BUT)) {
+      if ((long)(micros() - L_b_micros) >= debounceVal * 1000) {
+        B_bumped = 1;
+        PID_B_back.restart();
+        B_b_micros = micros();
+        step_counter = 0;
+      }
+    }
+  }
+}
+void BUTTON_Setup() {
+  if (BUMP_L) {
+    pinMode(L_BUT, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(L_BUT), L_Bump, FALLING);
+  }
+  if (BUMP_R) {
+    pinMode(R_BUT, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(R_BUT), R_Bump, FALLING);
+  }
+  if (BUMP_B) {
+    pinMode(B_BUT, INPUT_PULLDOWN_16);
+  }
+  taskScheduler.addTask(PID_B_left);
+  taskScheduler.addTask(PID_B_right);
+  taskScheduler.addTask(PID_B_front);
+  taskScheduler.addTask(PID_B_back);
+}
+/*End of Bump Button Code-----------------------------------------------------*/
+/*Motor PID Code--------------------------------------------------------------*/
+float Setpoint_offset = 1.5;
+float actualSetpoint = 35;  //85.714 RPM
+float Setpoint = 35, L_pidin, L_pidout, R_pidin, R_pidout;    //35
+//float Kp=7.2, Ki=0.065, Kd=0.01625; //Kcrit = 12, Pcrit = 130ms
+float Kp = 10.2, Ki = 0.03, Kd = 0.0075; //Kcrit = 17, Pcrit = 60ms (improved accuracy)
+
+PID L_PID(&L_pidin, &L_pidout, &Setpoint, Kp, Ki, Kd, REVERSE);
+PID R_PID(&R_pidin, &R_pidout, &Setpoint, Kp, Ki, Kd, REVERSE);
+
+void PID_Setup() {
+  L_PID.SetSampleTime(10); R_PID.SetSampleTime(10); //ms
+  L_PID.SetOutputLimits(0, 1023); R_PID.SetOutputLimits(0, 1023); //min max
+  L_PID.SetMode(MANUAL); R_PID.SetMode(MANUAL); //MANUAL to manually reset output, AUTOMATIC to let code auto set
+}
+
+const int STEADY_SAMPLES = 4;
+const float steady_state_err = 5;  //max allowed steady state err %
+const float steady_state_value = (actualSetpoint*steady_state_err) / 100.0;
+float prev_max = 0, prev_min = 100;
+float maxer[STEADY_SAMPLES], miner[STEADY_SAMPLES];
+float avg_max = 0, avg_min = 100;
+int max_counter = 0, min_counter = 0, max_samples = 0, min_samples = 0;
+bool prev_state = 0, current_state = 0, transition = 0;
+
+bool getSteadyState(float avgtp) {
+  if (avgtp > Setpoint) {
+    current_state = 1;
+    if (prev_max < avgtp)
+      prev_max = avgtp;
+    if (prev_state != current_state) { //transition
+      transition = 1;
+      if (min_counter == STEADY_SAMPLES) //if counter reach max
+        min_counter = 0;  //reset counter
+      miner[min_counter] = prev_min;  //store previous highest point
+      min_samples++; min_counter++;
+      avg_min = 0;
+      int i;  //declare locally to not affect other code
+      for (i = 0; i < min_samples && i < STEADY_SAMPLES; i++)
+        avg_min += miner[i];  //sum up all highest point
+      avg_min = (float)avg_min / (float)i; //determine current high point avg
+      prev_min = actualSetpoint;
+    }
+    prev_state = current_state;
+  }
+  else if (avgtp < Setpoint) {
+    current_state = 0;
+    if (prev_min > avgtp)
+      prev_min = avgtp;
+    if (prev_state != current_state) { //transition
+      transition = 1;
+      if (max_counter == STEADY_SAMPLES) //if counter reach max
+        max_counter = 0;  //reset counter
+      maxer[max_counter] = prev_max;  //store previous highest point
+      max_samples++; max_counter++;
+      avg_max = 0;
+      int i;  //declare locally to not affect other code
+      for (i = 0; i < max_samples && i < STEADY_SAMPLES; i++)
+        avg_max += maxer[i];  //sum up all highest point
+      avg_max = (float)avg_max / (float)i; //determine current high point avg
+      prev_max = actualSetpoint;
+    }
+    prev_state = current_state;
+  }
+  if (transition) {
+    //Wait until response signal is within +- Steady state error
+    if ( (avg_max - actualSetpoint) < steady_state_value && (actualSetpoint - avg_min) < steady_state_value ) {
+      //Serial.printf("Reached Steady State with Error of %f%%\n",steady_state_err);
+      return true;
+    }
+    transition = 0;
+  }
+  return false;
+}
+/*End of Motor PID Code-------------------------------------------------------*/
+/*Motor Driver Code-----------------------------------------------------------*/
+/* Since wheel circumference = 21.049cm, 1 slot movement = 1.052cm
+   A 360 rotate around Axis of Rotation with radius 6.5cm is 40.846cm
+   1 degree of rotation = 0.113cm, thus minimum rotation is 9.31 degree, using 1 slot,
+   but since the robot requires at least 2 slots to accurately measure and adjust the
+   speed of the wheel, by the time it sense to stop, 3 slots will have passed by.
+   Thus, with this limitation, it is much better to move straight then turn 90 degree
+   to reach the desired location instead.
+   Even so, that method comes with its complication such as hitting obstacles or walls
+   during the movement.
+   Another solution is to add 360 degrees if the desired angle of rotation is too small,
+   allowing the robot to readjust calculation to reach the desired angle in the end, albeit
+   having some errors.
+*/
+const uint8_t M1A = D7;
+const uint8_t M1B = D8;
+const uint8_t M2A = RX;
+const uint8_t M2B = D5;
+
+#define WHEEL_DIAMETER      6.7     //in cm
+#define WHEEL_CIRCUMFERENCE 21.049  //cm
+#define AOR_RADIUS          6.5     //distance from center of wheel to axis of rotation in cm
+#define DEFAULT_SPEED       550     //start with 550, then adjust to (600/1023)
+#define DEFAULT_SETPOINT    35
+
+void sendToRoot(char []);
+
+volatile float distanceToMove = 100;//cm
+int   L_pwm = 0,  R_pwm = 0;    //0 - 1023
+int   L_prev = 0, R_prev = 0;   //store previous PID speed
+
+Task PID_forward(0, TASK_ONCE, &PID_Forward);
+Task PID_rotate(0, TASK_ONCE, &PID_Rotate);
+
+void PID_MOTOR_Setup() {
+  PID_Setup();
+  if (MOTOR_CONTROL_L) {
+    L_pwm = DEFAULT_SPEED;
+    pinMode(M1A, OUTPUT);  pinMode(M2A, OUTPUT);
+    digitalWrite(M1A, 0);  digitalWrite(M2A, 0);
+  }
+  if (MOTOR_CONTROL_R) {
+    R_pwm = DEFAULT_SPEED;
+    pinMode(M1B, OUTPUT);  pinMode(M2B, OUTPUT);
+    digitalWrite(M2A, 0);  digitalWrite(M2B, 0);
+  }
+  if (MOTOR_CONTROL_L || MOTOR_CONTROL_R) {
+    taskScheduler.addTask(PID_forward);
+    taskScheduler.addTask(PID_rotate);
+  }
+}
+void PID_Forward() {
+  Setpoint = DEFAULT_SETPOINT;
+  float avgtp, tempL, tempR;  //temporary storage for avgtp, L & R tp
+  int donetime; //to measure time taken to complete action
+  int ticksRequired = round((distanceToMove / WHEEL_CIRCUMFERENCE) * 20); //distance to travel/circumference * slots
+  Serial.printf("Ticks Req:%d\n", ticksRequired);
+  if (L_prev != 0 && R_prev != 0) {
+    L_pwm = L_prev; R_pwm = R_prev; //use previous PID computed values
+  }
+  else{
+    L_pwm = DEFAULT_SPEED;  R_pwm = DEFAULT_SPEED;
+  }
+  L_PID.SetMode(MANUAL);    R_PID.SetMode(MANUAL);    //to manually reset output
+  L_pidout = (float)L_pwm;  R_pidout = (float)R_pwm;  //reset output value
+  L_PID.SetMode(AUTOMATIC); R_PID.SetMode(AUTOMATIC); //auto again
+  digitalWrite(M1B, 0); digitalWrite(M2B, 0); //Should set low first before starting motors, outside loop because it doesnt change
+  ENCODER_reset();  //reset all encoder values
+  donetime = millis();  //measure time for action to stop
+  L_move = 1; R_move = 1; //start moving
+  //L_avgtp = millis(); R_avgtp = millis(); //to start counting first tick (0 -> 1)
+  analogWrite(M1A, L_pwm); analogWrite(M2A, R_pwm); //Start motors, so that first tp can be measured
+  while ( ( (L_tss < ticksRequired) || (R_tss < ticksRequired) ) && !L_bumped && !R_bumped && !B_bumped && !F_bumped){
+    if (L_tss > 1 && L_tss < ticksRequired) { //once the first tp is measured, then start computing PID
+      avgtp = L_avgtp;  //temporarily store current avg tp
+      tempL = avgtp;    //to send to app
+      L_pidin = avgtp;  //input PID value
+      L_PID.Compute();  //Compute the output based on err/delta
+      L_pwm = (int)round(L_pidout);  //round off and convert to int
+      L_prev = L_pwm;   //store PID-ed value for next time
+    }
+    else if (L_tss >= ticksRequired) { //if already reached supposed ticks, stop motor
+      L_pwm = 0;  L_move = 0;
+    }
+    if (R_tss > 1 && R_tss < ticksRequired) { //once the first tp is measured, then start computing PID
+      avgtp = R_avgtp;  //temporarily store current avg tp
+      tempR = avgtp;    //to send to app
+      R_pidin = avgtp;  //input PID value
+      R_PID.Compute();  //Compute the output based on err/delta
+      R_pwm = (int)round(R_pidout);  //round off and convert to int
+      R_prev = R_pwm;
+    }
+    else if (R_tss >= ticksRequired) { //if already reached supposed ticks, stop motor
+      R_pwm = 0;  R_move = 0;
+    }
+    int temp_Lspeed, temp_Rspeed;
+    if (abs(R_tss - L_tss) > 1 && R_tss > 1 && R_tss < ticksRequired && L_tss > 1 && L_tss < ticksRequired) {
+      int tickDiff = abs(R_tss - L_tss);
+      float enhancer = 0.05 * tickDiff;
+      float dehancer = 1.0 - enhancer;
+      if (R_tss > L_tss) {
+        temp_Lspeed = round((enhancer + 1.0) * L_pwm);
+        temp_Rspeed = round(dehancer * R_pwm);
+      }
+      else {
+        temp_Rspeed = round((enhancer + 1.0) * R_pwm);
+        temp_Lspeed = round(dehancer * L_pwm);
+      }
+    }
+    else {
+      temp_Lspeed = L_pwm;
+      temp_Rspeed = R_pwm;
+    }
+    analogWrite(M1A, temp_Lspeed); analogWrite(M2A, temp_Rspeed); //Change motor value
+    //Serial.printf("L_pwm:%d,L_val:%f,L_avg:%f,L_tss:%d\n",L_pwm,L_pidout,avgtp,L_tss);
+    //char data[100];
+    //sprintf(data,"%s:L_TP,%f,R_TP,%f,%d\n","MOVINGGUY",tempL,tempR,L_tss);
+    //sendToRoot(data);
+    yield();
+  }
+  donetime = millis() - donetime;
+  digitalWrite(M1B, 0); digitalWrite(M2B, 0);
+  digitalWrite(M1A, 0); digitalWrite(M2A, 0); //stop both wheels
+  L_move = 0; R_move = 0; //stop recording tp
+  Serial.printf("In:%.2f,Out:%d,Delta:%.2f,Set:%.2f\n", L_avgtp, L_pwm, L_avgtp - actualSetpoint, actualSetpoint);
+  Serial.printf("Total time taken:%d\n", donetime);
+  ENCODER_reset();  //reset values
+}
+
+void PID_Backward() {
+  Setpoint = DEFAULT_SETPOINT;
+  float avgtp, tempL, tempR;  //temporary storage for avgtp, L & R tp
+  int donetime; //to measure time taken to complete action
+  int ticksRequired = round((distanceToMove / WHEEL_CIRCUMFERENCE) * 20); //distance to travel/circumference * slots
+  Serial.printf("Ticks Req:%d\n", ticksRequired);
+  if (L_prev != 0 && R_prev != 0) {
+    L_pwm = L_prev; R_pwm = R_prev; //use previous PID computed values
+  }
+  else{
+    L_pwm = DEFAULT_SPEED;  R_pwm = DEFAULT_SPEED;
+  }
+  L_PID.SetMode(MANUAL);    R_PID.SetMode(MANUAL);    //to manually reset output
+  L_pidout = (float)L_pwm;  R_pidout = (float)R_pwm;  //reset output value
+  L_PID.SetMode(AUTOMATIC); R_PID.SetMode(AUTOMATIC); //auto again
+  digitalWrite(M1A, 0); digitalWrite(M2A, 0); //Should set low first before starting motors, outside loop because it doesnt change
+  ENCODER_reset();  //reset all encoder values
+  donetime = millis();  //measure time for action to stop
+  L_move = 1; R_move = 1; //start moving
+  //L_avgtp = millis(); R_avgtp = millis(); //to start counting first tick (0 -> 1)
+  analogWrite(M1B, L_pwm); analogWrite(M2B, R_pwm); //Start motors, so that first tp can be measured
+  while ( ( (L_tss < ticksRequired) || (R_tss < ticksRequired) ) && !L_bumped && !R_bumped && !B_bumped && !F_bumped){
+    if (L_tss > 1 && L_tss < ticksRequired) { //once the first tp is measured, then start computing PID
+      avgtp = L_avgtp;  //temporarily store current avg tp
+      tempL = avgtp;    //to send to app
+      L_pidin = avgtp;  //input PID value
+      L_PID.Compute();  //Compute the output based on err/delta
+      L_pwm = (int)round(L_pidout);  //round off and convert to int
+      L_prev = L_pwm;   //store PID-ed value for next time
+    }
+    else if (L_tss >= ticksRequired) { //if already reached supposed ticks, stop motor
+      L_pwm = 0;  L_move = 0;
+    }
+    if (R_tss > 1 && R_tss < ticksRequired) { //once the first tp is measured, then start computing PID
+      avgtp = R_avgtp;  //temporarily store current avg tp
+      tempR = avgtp;    //to send to app
+      R_pidin = avgtp;  //input PID value
+      R_PID.Compute();  //Compute the output based on err/delta
+      R_pwm = (int)round(R_pidout);  //round off and convert to int
+      R_prev = R_pwm;
+    }
+    else if (R_tss >= ticksRequired) { //if already reached supposed ticks, stop motor
+      R_pwm = 0;  R_move = 0;
+    }
+    int temp_Lspeed, temp_Rspeed;
+    if (abs(R_tss - L_tss) > 1 && R_tss > 1 && R_tss < ticksRequired && L_tss > 1 && L_tss < ticksRequired) {
+      int tickDiff = abs(R_tss - L_tss);
+      float enhancer = 0.05 * tickDiff;
+      float dehancer = 1.0 - enhancer;
+      if (R_tss > L_tss) {
+        temp_Lspeed = round((enhancer + 1.0) * L_pwm);
+        temp_Rspeed = round(dehancer * R_pwm);
+      }
+      else {
+        temp_Rspeed = round((enhancer + 1.0) * R_pwm);
+        temp_Lspeed = round(dehancer * L_pwm);
+      }
+    }
+    else {
+      temp_Lspeed = L_pwm;
+      temp_Rspeed = R_pwm;
+    }
+    analogWrite(M1B, temp_Lspeed); analogWrite(M2B, temp_Rspeed); //Change motor value
+    //Serial.printf("L_pwm:%d,L_val:%f,L_avg:%f,L_tss:%d\n",L_pwm,L_pidout,avgtp,L_tss);
+    //char data[100];
+    //sprintf(data,"%s:L_TP,%f,R_TP,%f,%d\n","MOVINGGUY",tempL,tempR,L_tss);
+    //sendToRoot(data);
+    yield();
+  }
+  donetime = millis() - donetime;
+  digitalWrite(M1B, 0); digitalWrite(M2B, 0);
+  digitalWrite(M1A, 0); digitalWrite(M2A, 0); //stop both wheels
+  L_move = 0; R_move = 0; //stop recording tp
+  Serial.printf("In:%.2f,Out:%d,Delta:%.2f,Set:%.2f\n", L_avgtp, L_pwm, L_avgtp - actualSetpoint, actualSetpoint);
+  Serial.printf("Total time taken:%d\n", donetime);
+  ENCODER_reset();  //reset values
+}
+
+#define ROTATE_SPEED        350
+#define ROTATE_SETPOINT     45
+volatile bool   rotate_Clockwise = 1; //default clockwise rotation
+volatile float  angleToRotate = 90;   //degrees
+const float     angleErrorRange = 5;  //+- 5 degree difference
+int L_front, L_back, R_front, R_back;
+int L_prev_rot = 0, R_prev_rot = 0;
+
+void change_Rotate(){
+  if (rotate_Clockwise) {
+    L_front = M1A;  L_back = M1B;
+    R_front = M2B;  R_back = M2A;
+  }
+  else {
+    L_front = M1B;  L_back = M1A;
+    R_front = M2A;  R_back = M2B;
+  }
+}
+
+void PID_Rotate() {
+  Setpoint = ROTATE_SETPOINT; //set target wheel speed
+  float avgtp, tempL, tempR;  //temporary storage for avgtp, L & R tp
+  int donetime; //to measure time taken to complete action
+  if(angleToRotate >=0 && angleToRotate <= 10.0){
+    angleToRotate = angleToRotate + 360.0;
+  }
+  else if(angleToRotate < 0){
+    angleToRotate = 360.0;
+  }
+  float multiplier = (float)angleToRotate/360.0;
+  if(multiplier > 720){
+    multiplier = 2;
+  }
+  else if(multiplier < 0){
+    multiplier = 1;
+  }
+  float distanceToRotate = (float)(2 * M_PI * AOR_RADIUS) * multiplier;
+  int ticksRequired = round((distanceToRotate / WHEEL_CIRCUMFERENCE) * 20); //distance to travel/circumference * slots
+  Serial.printf("Ticks Req:%d\n", ticksRequired);
+  rotate_Clockwise = 1; //best to rotate clockwise
+  change_Rotate();
+  if (L_prev_rot != 0 && R_prev_rot != 0) {
+    L_pwm = L_prev_rot; R_pwm = R_prev_rot;     //use previous PID computed values
+  }
+  else{
+    L_pwm = ROTATE_SPEED; R_pwm = ROTATE_SPEED; //default rotation speed, slower than straight movement
+  }
+  L_PID.SetMode(MANUAL);    R_PID.SetMode(MANUAL);    //to manually reset output
+  L_pidout = (float)L_pwm;  R_pidout = (float)R_pwm;  //reset output value
+  L_PID.SetMode(AUTOMATIC); R_PID.SetMode(AUTOMATIC); //auto again
+  digitalWrite(L_back, 0); digitalWrite(R_back, 0); //Should set low first before starting motors, outside loop because it doesnt change
+  ENCODER_reset();  //reset all encoder values
+  donetime = millis();  //measure time for action to stop
+  L_move = 1; R_move = 1; //start moving
+  //L_avgtp = millis(); R_avgtp = millis(); //to start counting first tick (0 -> 1)
+  analogWrite(L_front, L_pwm); analogWrite(R_front, R_pwm); //Start motors, so that first tp can be measured
+  while ( ( (L_tss < ticksRequired) || (R_tss < ticksRequired) ) && !L_bumped && !R_bumped && !B_bumped && !F_bumped) {
+    if (L_tss > 1 && L_tss < ticksRequired) { //once the first tp is measured, then start computing PID
+      avgtp = L_avgtp;  //temporarily store current avg tp
+      tempL = avgtp;    //to send to app
+      L_pidin = avgtp;  //input PID value
+      L_PID.Compute();  //Compute the output based on err/delta
+      L_pwm = (int)round(L_pidout);  //round off and convert to int
+      L_prev_rot = L_pwm;   //store PID-ed value for next time
+    }
+    else if (L_tss >= ticksRequired) { //if already reached supposed ticks, stop motor
+      L_pwm = 0;  L_move = 0;
+    }
+    if (R_tss > 1 && R_tss < ticksRequired) { //once the first tp is measured, then start computing PID
+      avgtp = R_avgtp;  //temporarily store current avg tp
+      tempR = avgtp;    //to send to app
+      R_pidin = avgtp;  //input PID value
+      R_PID.Compute();  //Compute the output based on err/delta
+      R_pwm = (int)round(R_pidout);  //round off and convert to int
+      R_prev_rot = R_pwm;
+    }
+    else if (R_tss >= ticksRequired) { //if already reached supposed ticks, stop motor
+      R_pwm = 0;  R_move = 0;
+    }
+    int temp_Lspeed, temp_Rspeed;
+    if (abs(R_tss - L_tss) > 1 && R_tss > 1 && R_tss < ticksRequired && L_tss > 1 && L_tss < ticksRequired) {
+      int tickDiff = abs(R_tss - L_tss);
+      float enhancer = 0.05 * tickDiff;
+      float dehancer = 1.0 - enhancer;
+      if (R_tss > L_tss) {
+        temp_Lspeed = round((enhancer + 1.0) * L_pwm);
+        temp_Rspeed = round(dehancer * R_pwm);
+      }
+      else {
+        temp_Rspeed = round((enhancer + 1.0) * R_pwm);
+        temp_Lspeed = round(dehancer * L_pwm);
+      }
+    }
+    else {
+      temp_Lspeed = L_pwm;
+      temp_Rspeed = R_pwm;
+    }
+    analogWrite(L_front, temp_Lspeed); analogWrite(R_front, temp_Rspeed); //Change motor value
+    //Serial.printf("L_pwm:%d,L_val:%f,L_avg:%f,L_tss:%d\n",L_pwm,L_pidout,avgtp,L_tss);
+    //char data[100];
+    //sprintf(data,"%s:L_TP,%f,R_TP,%f,%d\n","MOVINGGUY",tempL,tempR,L_tss);
+    //sendToRoot(data);
+    yield();
+  }
+  donetime = millis() - donetime;
+  digitalWrite(L_back, 0);  digitalWrite(R_back, 0);
+  digitalWrite(L_front, 0); digitalWrite(R_front, 0); //stop both wheels
+  L_move = 0; R_move = 0; //stop recording tp
+  Serial.printf("In:%.2f,Out:%d,Delta:%.2f,Set:%.2f\n", L_avgtp, L_pwm, L_avgtp - actualSetpoint, actualSetpoint);
+  Serial.printf("Total time taken:%d\n", donetime);
+  ENCODER_reset();  //reset values
+}
+void PID_Cali_Rotate() {
+  Setpoint = ROTATE_SETPOINT; //set target wheel speed
+  float avgtp, tempL, tempR;  //temporary storage for avgtp, L & R tp
+  int donetime; //to measure time taken to complete action
+  float distanceToRotate = (2 * M_PI * AOR_RADIUS) * (720 / 360.0);
+  int ticksRequired = round((distanceToRotate / WHEEL_CIRCUMFERENCE) * 20); //distance to travel/circumference * slots
+  Serial.printf("Ticks Req:%d\n", ticksRequired);
+  rotate_Clockwise = 1; //best to rotate clockwise
+  change_Rotate();
+  if (L_prev_rot != 0 && R_prev_rot != 0) {
+    L_pwm = L_prev_rot; R_pwm = R_prev_rot;     //use previous PID computed values
+  }
+  else{
+    L_pwm = ROTATE_SPEED; R_pwm = ROTATE_SPEED; //default rotation speed, slower than straight movement
+  }
+  L_PID.SetMode(MANUAL);    R_PID.SetMode(MANUAL);    //to manually reset output
+  L_pidout = (float)L_pwm;  R_pidout = (float)R_pwm;  //reset output value
+  L_PID.SetMode(AUTOMATIC); R_PID.SetMode(AUTOMATIC); //auto again
+  digitalWrite(L_back, 0); digitalWrite(R_back, 0); //Should set low first before starting motors, outside loop because it doesnt change
+  ENCODER_reset();  //reset all encoder values
+  donetime = millis();  //measure time for action to stop
+  L_move = 1; R_move = 1; //start moving
+  //L_avgtp = millis(); R_avgtp = millis(); //to start counting first tick (0 -> 1)
+  analogWrite(L_front, L_pwm); analogWrite(R_front, R_pwm); //Start motors, so that first tp can be measured
+  while ( ( (L_tss < ticksRequired) || (R_tss < ticksRequired) ) && !L_bumped && !R_bumped && !B_bumped && !F_bumped) {
+    if (L_tss > 1 && L_tss < ticksRequired) { //once the first tp is measured, then start computing PID
+      avgtp = L_avgtp;  //temporarily store current avg tp
+      tempL = avgtp;    //to send to app
+      L_pidin = avgtp;  //input PID value
+      L_PID.Compute();  //Compute the output based on err/delta
+      L_pwm = (int)round(L_pidout);  //round off and convert to int
+      L_prev_rot = L_pwm;   //store PID-ed value for next time
+    }
+    else if (L_tss >= ticksRequired) { //if already reached supposed ticks, stop motor
+      L_pwm = 0;  L_move = 0;
+    }
+    if (R_tss > 1 && R_tss < ticksRequired) { //once the first tp is measured, then start computing PID
+      avgtp = R_avgtp;  //temporarily store current avg tp
+      tempR = avgtp;    //to send to app
+      R_pidin = avgtp;  //input PID value
+      R_PID.Compute();  //Compute the output based on err/delta
+      R_pwm = (int)round(R_pidout);  //round off and convert to int
+      R_prev_rot = R_pwm;
+    }
+    else if (R_tss >= ticksRequired) { //if already reached supposed ticks, stop motor
+      R_pwm = 0;  R_move = 0;
+    }
+    int temp_Lspeed, temp_Rspeed;
+    if (abs(R_tss - L_tss) > 1 && R_tss > 1 && R_tss < ticksRequired && L_tss > 1 && L_tss < ticksRequired) {
+      int tickDiff = abs(R_tss - L_tss);
+      float enhancer = 0.05 * tickDiff;
+      float dehancer = 1.0 - enhancer;
+      if (R_tss > L_tss) {
+        temp_Lspeed = round((enhancer + 1.0) * L_pwm);
+        temp_Rspeed = round(dehancer * R_pwm);
+      }
+      else {
+        temp_Rspeed = round((enhancer + 1.0) * R_pwm);
+        temp_Lspeed = round(dehancer * L_pwm);
+      }
+    }
+    else {
+      temp_Lspeed = L_pwm;
+      temp_Rspeed = R_pwm;
+    }
+    analogWrite(L_front, temp_Lspeed); analogWrite(R_front, temp_Rspeed); //Change motor value
+    QMC5883L_read();
+    //Serial.printf("L_pwm:%d,L_val:%f,L_avg:%f,L_tss:%d\n",L_pwm,L_pidout,avgtp,L_tss);
+    //char data[100];
+    //sprintf(data,"%s:L_TP,%f,R_TP,%f,%d\n","MOVINGGUY",tempL,tempR,L_tss);
+    //sendToRoot(data);
+    yield();
+  }
+  donetime = millis() - donetime;
+  digitalWrite(L_back, 0);  digitalWrite(R_back, 0);
+  digitalWrite(L_front, 0); digitalWrite(R_front, 0); //stop both wheels
+  L_move = 0; R_move = 0; //stop recording tp
+  Serial.printf("In:%.2f,Out:%d,Delta:%.2f,Set:%.2f\n", L_avgtp, L_pwm, L_avgtp - actualSetpoint, actualSetpoint);
+  Serial.printf("Total time taken:%d\n", donetime);
+  ENCODER_reset();  //reset values
+}
+void PID_North(){
+  FUSION_read();      //read MPU6050 and magnetometer values
+  delay(10);          //to let some time pass
+  FUSION_read();      //read again and calculate using latest dt
+  float currentAngle = compAngleZ;  //using complementary filter for faster response
+  if (currentAngle < 0) { //rescale it to 360 degree instead
+    currentAngle = (180.0 + currentAngle) + 180.0;
+  }
+  angleToRotate = fabs(currentAngle);
+  PID_Rotate();
+}
+void PID_antiNorth(){
+  FUSION_read();      //read MPU6050 and magnetometer values
+  delay(10);          //to let some time pass
+  FUSION_read();      //read again and calculate using latest dt
+  float currentAngle = compAngleZ;  //using complementary filter for faster response
+  currentAngle += 180.0;
+  angleToRotate = fabs(currentAngle);
+  PID_Rotate();
+}
+void PID_B_Left(){
+  L_bumped = 0;
+  distanceToMove = 5;
+  PID_Backward();
+  distanceToMove = 100;
+  
+  rotate_Clockwise = 1;
+  change_Rotate();
+  angleToRotate = 45.0;
+  PID_Rotate();
+}
+void PID_B_Right(){
+  R_bumped = 0;
+  distanceToMove = 5;
+  PID_Backward();
+  distanceToMove = 100;
+  
+  rotate_Clockwise = 0;
+  change_Rotate();
+  angleToRotate = 45.0;
+  PID_Rotate();
+  rotate_Clockwise = 1;
+  change_Rotate();
+}
+void PID_B_Front(){
+  F_bumped = 0;
+  distanceToMove = 5;
+  PID_Backward();
+  distanceToMove = 100;
+}
+void PID_B_Back(){
+  B_bumped = 0;
+  distanceToMove = 5;
+  PID_Forward();
+  distanceToMove = 100;
+}
+/*End of Motor Driver Code----------------------------------------------------*/
+/*WiFi Codes------------------------------------------------------------------*/
+#define WIFI_MODE     WIFI_AP_STA   //set wifi mode here, AP_STA is access point and station mode together
+#define WIFI_SSID     "Swarm_Intel" //same as mesh_wifi
+#define WIFI_PASSWORD "password"
+#define WIFI_MAX  15
+#define WIFI_CHAR 12        //MAC address without any symbols is only 12 characters, + 1 to terminate, so 13
+#define STORE_SWARM_ONLY 1  //1 for yes, 0 for no
+
+typedef struct {
+  char ssid[WIFI_CHAR];
+  char mac[WIFI_CHAR];
+  uint32_t intmac;  //only stores the last 8bit of the MAC in int form
+  int  rssi;
+  float distance;
+  bool secured = 0; //0 if unsecured, 1 if secured
+} wifiNetwork;      //wifi info structure/map
+
+char ownMAC[WIFI_CHAR];
+uint32_t ownintMAC;
+bool scanCompleted = 0; //0 if haven't complete scanning, 1 if done
+int  samples = 0;
+int swarmNetworks;
+
+void scanNetwork();
+void saveNetwork();
+
+wifiNetwork availableNetworks[WIFI_MAX];  //declares an array to store network info
+
+Task scanNodes(0, TASK_ONCE, &scanNetwork);
+Task checkScan(1000, TASK_FOREVER, &saveNetwork);
+
+void WiFi_Setup() {
+  if (WIFISCANNER) {
+    taskScheduler.addTask(scanNodes);
+    taskScheduler.addTask(checkScan);
+    //scanNodes.enable();
+  }
+}
+
+void saveOwnMac() {
+  char rawMAC[18];  //mac string length is 18
+  char concatMAC[9];
+  WiFi.macAddress().toCharArray(rawMAC, sizeof(rawMAC));
+  int tempMACnum = 0; //counter for temporary storage
+  for (int k = 0; k < sizeof(rawMAC); k++) {
+    if (rawMAC[k] != ':' && rawMAC[k] != '\0') { //find and remove ':' & '\0' characters
+      ownMAC[tempMACnum] = rawMAC[k];  //store non-':' char into temp storage
+      if(tempMACnum > 3)
+        concatMAC[tempMACnum-4]=rawMAC[k];
+      tempMACnum++;
+    }
+  }
+  ownMAC[tempMACnum] = '\0'; //terminate
+  concatMAC[8] = '\0';
+  ownintMAC = strtoul(concatMAC,NULL,16);
+  Serial.printf("SAVED:%u\n",ownintMAC);
+}
+
+void Locate();
+void scanNetwork() {
+  scanCompleted = 0;
+  memset(availableNetworks, (char)0, WIFI_MAX); //clears all previous wifi info
+  WiFi.mode(WIFI_MODE); //station mode = 3, access point + station
+  WiFi.scanDelete();    //reset scanned connections
+  WiFi.scanNetworks(true, false); //scan asynchronously, but has to check with .scanComplete, (async,showhidden)
+  samples++;  //to check how many times scanned
+  startScan = 1;
+  checkScan.enable();
+}
+
+void saveNetwork() {
+  int networksFound = WiFi.scanComplete();  //store scan status/networks found
+  swarmNetworks = 0;
+  if (networksFound < 0) { //scan issues
+    if (networksFound == -1) { //scanning in process
+      Serial.println("Scanning still in progress");
+    }
+    else if (networksFound == -2) { //scan not triggered
+      Serial.println("Scan not triggered");
+      scanNodes.restartDelayed(200);
+    }
+  }
+  else { //scan completed
+    if (networksFound == 0) { //no networks found
+      Serial.println("No networks found");  //do nothing, or add some codes
+    }
+    else if (STORE_SWARM_ONLY) { //stores only "Swarm_Intel" SSIDs
+      for (int i = 0; i < networksFound; i++) { //store wifi info while sorting
+        if (WiFi.SSID(i) == WIFI_SSID) { //compare String(ssid) with "Swarm_Intel"
+          /*Store all collected data into wifiNetwork object first*/
+          char rawMAC[18];  //mac string length is 18
+          WiFi.SSID(i).toCharArray(availableNetworks[swarmNetworks].ssid, sizeof(availableNetworks[swarmNetworks].ssid));   //store ssid
+          WiFi.BSSIDstr(i).toCharArray(rawMAC, sizeof(rawMAC)); //store MAC with ':'
+          availableNetworks[swarmNetworks].rssi = WiFi.RSSI(i); //store RSSI in dBm
+          availableNetworks[swarmNetworks].distance = PL_calcDistance(availableNetworks[swarmNetworks].rssi * (-1)); //convert to -dBm
+          WiFi.encryptionType(i) == ENC_TYPE_NONE ? //check encryption type
+          availableNetworks[swarmNetworks].secured = 0
+              :
+              availableNetworks[swarmNetworks].secured = 1;
+          /*Filter out ":" character from the stored mac address*/
+          char concatMAC[9];
+          int tempMACnum = 0; //counter for temporary storage
+          for (int k = 0; k < sizeof(rawMAC); k++) {
+            if (rawMAC[k] != ':' && rawMAC[k] != '\0') { //find and remove ':' & '\0' characters
+              availableNetworks[swarmNetworks].mac[tempMACnum] = rawMAC[k];  //store non-':' char into temp storage
+              if(tempMACnum > 3)
+                concatMAC[tempMACnum-4]=rawMAC[k];
+              tempMACnum++;
+            }
+          }
+          availableNetworks[swarmNetworks].mac[tempMACnum] = '\0';
+          concatMAC[8] = '\0';
+          availableNetworks[swarmNetworks].intmac = strtoul(concatMAC,NULL,16);
+          Serial.printf("CONVERTED:%u\n",availableNetworks[swarmNetworks].intmac);
+          /*Sort the collected Swarm macs according to RSSI in descending order*/
+          if (swarmNetworks > 0) { //only start sorting after at least 2 data stored, sorts every i increment (on every new network added)
+            for (int j = swarmNetworks; (availableNetworks[j].rssi > availableNetworks[j - 1].rssi && j > 0); j--) { //insertion sort, descending order
+              wifiNetwork tempNetwork = availableNetworks[j];
+              availableNetworks[j] = availableNetworks[j - 1];
+              availableNetworks[j - 1] = tempNetwork;
+            }
+          }
+          swarmNetworks++;
+        }
+      }
+      /*Print out data into excel sheet*/
+      Serial.printf("DATA,TIME,%d,", samples);
+      Serial.print(ownMAC);
+      for (int i = 0; i < swarmNetworks; i++) {
+        if (strcmp(availableNetworks[i].ssid, WIFI_SSID) == 0) { //check if SSID is "Swarm_Intel" although theoretically should only have that
+          Serial.print(",");
+          for (int z = 0; z < sizeof(availableNetworks[i].mac); z++)
+            Serial.print(availableNetworks[i].mac[z]);
+          Serial.printf(",%d", availableNetworks[i].rssi);
+          Serial.printf(",%.3f", availableNetworks[i].distance);
+        }
+      }
+      Serial.println(",AUTOSCROLL_20"); //to autoscroll excel sheet and go to next line
+      Locate();
+    }
+    else { //Stores all known SSIDs
+      Serial.printf("%d networks found\n", networksFound);
+      for (int i = 0; i < networksFound; i++) { //store wifi info while sorting
+        /*Store all collected data into wifiNetwork object first*/
+        WiFi.SSID(i).toCharArray(availableNetworks[i].ssid, sizeof(availableNetworks[i].ssid));   //store ssid
+        WiFi.BSSIDstr(i).toCharArray(availableNetworks[i].mac, sizeof(availableNetworks[i].mac)); //store MAC with ':'
+        availableNetworks[i].rssi = WiFi.RSSI(i); //store RSSI in dbm
+        WiFi.encryptionType(i) == ENC_TYPE_NONE ? //check encryption type
+        availableNetworks[i].secured = 0
+                                       :
+        availableNetworks[i].secured = 1;
+        /*Filter out ":" character from the stored mac address*/
+        char tempMAC[sizeof(availableNetworks[i].mac)];  //temporary storage for MAC without ':'
+        int tempMACnum = 0; //counter for temporary storage
+        for (int k = 0; k < sizeof(availableNetworks[i].mac); k++) {
+          if (availableNetworks[i].mac[k] != ':') { //find and remove ':' characters
+            tempMAC[tempMACnum] = availableNetworks[i].mac[k];  //store non-':' char into temp storage
+            tempMACnum++;
+          }
+          availableNetworks[i].mac[k] = 0;  //clear original storage
+        }
+        for (int L = 0; L < tempMACnum; L++) {
+          availableNetworks[i].mac[L] = tempMAC[L]; //copy over non-':' char from temp storage to cleared original storage
+        }
+        /*Sort the collected Swarm macs according to RSSI in descending order*/
+        if (i > 0) { //only start sorting after 2 data stored, sorts every i increment (on every new network added)
+          for (int j = swarmNetworks; (availableNetworks[j].rssi > availableNetworks[j - 1].rssi && j > 0); j--) { //insertion sort, descending order
+            wifiNetwork tempNetwork = availableNetworks[j];
+            availableNetworks[j] = availableNetworks[j - 1];
+            availableNetworks[j - 1] = tempNetwork;
+          }
+        }
+      }
+      /*Print out all found networks with their RSSI value*/
+      for (int i = 0; i < networksFound; i++) {
+        Serial.printf("%d:", i + 1);
+        Serial.print(availableNetworks[i].ssid);
+        Serial.printf("(%d) ", availableNetworks[i].rssi);
+        Serial.println(availableNetworks[i].mac);
+      }
+    }
+    scanCompleted = 1;
+    getScan = 1;
+    checkScan.disable();
+    //scanNodes.restartDelayed(200);
+  }
+}
+
+/*To set as Access point mode*/
+String  SELF_SSID = "ESP_";
+#define SELF_PASSWORD "password"
+#define SELF_CHANNEL 0
+#define SELF_HIDDEN false
+#define SELF_MAX_CONNECTION 8
+void configureAccessPoint() {
+  if (WIFIAPMODE) {
+    SELF_SSID.concat(String(ESP.getChipId(), HEX)); //SSID becomes "ESP_{chipID}"
+    Serial.println(WiFi.softAP(SELF_SSID, SELF_PASSWORD, SELF_CHANNEL, SELF_HIDDEN, SELF_MAX_CONNECTION) ? "Soft AP Success" : "Soft AP Failed");
+  }
+}
+/*End of WiFi Codes-----------------------------------------------------------*/
+/*Async Server & WebSocket Codes----------------------------------------------*/
+#define STATION_SSID     "Swarm"
+#define STATION_PASSWORD "password"
+#define HOSTNAME "SWARM_BRIDGE"
+
+IPAddress local_IP(192, 168, 43, 111);
+IPAddress gateway(192, 168, 43, 1);
+IPAddress subnet(255, 255, 255, 0);
+IPAddress primaryDNS(8, 8, 8, 8);
+IPAddress secondaryDNS(8, 8, 4, 4);
+
+AsyncWebServer server(80);
+WebSocketsServer webSocket(81);
+
+Task sendThings(2000, TASK_FOREVER, &sendTestData);
+
+void AsyncServer_Setup() {
+  if (ASYNCSERVER) {
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest * request) {
+      request->send(200, "text/plain", "HELLO WORLD");
+      if (request->hasArg("BROADCAST")) {
+        String msg = request->arg("BROADCAST");
+        Serial.println(msg);
+      }
+    });
+    server.begin();
+  }
+}
+
+void WebSocket_Setup() {
+  if (WEBSOCKET) {
+    WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS);
+    webSocket.onEvent(webSocketEvent);
+    webSocket.begin();
+    taskScheduler.addTask(sendThings);
+    sendThings.enable();
+    sendThings.restart();
+  }
+}
+
+void WebSocket_Stop() {
+  webSocket.close();
+}
+
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t lenght) {
+  switch (type) {
+    case WStype_DISCONNECTED:             // if the websocket is disconnected
+      Serial.printf("[%u] Disconnected!\n", num);
+      break;
+    case WStype_CONNECTED: {              // if a new websocket connection is established
+        IPAddress ip = webSocket.remoteIP(num);
+        Serial.printf("[%u] Connected from %d.%d.%d.%d url: %s\n", num, ip[0], ip[1], ip[2], ip[3], payload);
+      }
+      break;
+    case WStype_TEXT:                     // if new text data is received
+      Serial.printf("[%u] get Text: %s\n", num, payload);
+      break;
+  }
+}
+
+void sendTestData() {
+  char data[100];
+  sprintf(data, "%s:Sample,%d\n", ownMAC, millis());
+  webSocket.broadcastTXT(data);
+  Serial.printf("Sent Socket,%s", data);
+}
+
+void sendNodeData(String data) {
+  webSocket.broadcastTXT(data);
+  Serial.println(data);
+}
+/*End of Async Server & WebSocket Codes---------------------------------------*/
+/*Mesh Codes------------------------------------------------------------------*/
+#define MESH_SSID "Swarm_Intel"
+#define MESH_PASSWORD "password"
+#define MESH_PORT 5555
+
+#define MESH_TIMEOUT 10000  //10sec
+int currentNodeCount = 0;
+uint32_t nodeList[10];
+uint32_t selfNodeID;
+uint32_t currentMaster;
+
+int current_step = 0;
+int head_count = 0;
+uint32_t nodeCount[10];
+bool node_move = 0;
+long int mesh_timer = 0;
+
+painlessMesh mesh;
+
+Task communicate(0, TASK_ONCE, &communicateWithNodes);
+
+void mesh_Setup() {
+  if (MESHNETWORK) {
+    mesh.setDebugMsgTypes( ERROR | STARTUP | CONNECTION );  // set before init() so that you can see startup messages
+    mesh.init(MESH_SSID, MESH_PASSWORD, &taskScheduler, MESH_PORT, WIFI_AP_STA, 6);
+    mesh.onReceive(&sync);
+    mesh.onNewConnection(&newConnectionCallback);
+    mesh.onChangedConnections(&onChangedConnections);
+    mesh.setRoot(false);
+    mesh.setContainsRoot(true);
+
+    saveOwnMac();
+    if(ownintMAC == ROOTID){
+      isROOT = 1;
+      mesh.stationManual(STATION_SSID, STATION_PASSWORD); //connect hotspot
+      mesh.setHostname(HOSTNAME);
+      mesh.setRoot(true);
+    }
+
+    selfNodeID = mesh.getNodeId();
+    currentMaster = selfNodeID;
+    addSelfToNodeList();
+
+    taskScheduler.addTask(communicate);
+    //communicate.enable();
+  }
+}
+void newConnectionCallback(uint32_t nodeID) {
+  updateNodeList();
+  printNodeList();
+  selectMaster();
+  step_counter = 0;
+}
+void onChangedConnections() {
+  updateNodeList();
+  printNodeList();
+  selectMaster();
+  step_counter = 0;
+}
+void sync(uint32_t from, String &msg) {
+  String json;
+  DynamicJsonDocument doc(1024);
+  json = msg.c_str();
+  DeserializationError error = deserializeJson(doc, json);
+  if (error)
+  {
+    Serial.print("deserializeJson() failed: ");
+    Serial.println(error.c_str());
+  }
+  if (selfNodeID != ROOTID) {
+    if (currentMaster == selfNodeID) {
+      if(findNode(from) < 0){
+        nodeCount[head_count] = from;
+        head_count++;
+      }
+    }
+    else {
+      if(from == currentMaster){
+        current_step = doc["current_step"];
+        node_move = 1;
+      }
+    }
+  }
+  else {
+    String text = doc["Print"];
+    sendNodeData(text);
+  }
+}
+void waitForNodes(){
+  if( ( (currentNodeCount > 1) && (head_count >= (currentNodeCount - 1) ) || ( (millis() - mesh_timer)>MESH_TIMEOUT) )){  //currentNodeCount - 1 because master counts as 1
+    for(int i=0;i<head_count;i++){
+      nodeCount[i] = 0;
+    }
+    head_count = 0;
+    
+    current_step++;
+    if(current_step > 5){
+      current_step = 0;
+    }
+    DynamicJsonDocument doc(1024);
+    doc["current_step"] = current_step;
+    String msg;
+    serializeJson(doc,msg);
+    mesh.sendBroadcast(msg);
+    step_counter++;
+    mesh_timer = millis();
+  }
+}
+void waitForMaster(){
+  if(node_move == 1){
+    step_counter++;
+  }
+}
+void pingMaster(){
+  if (selfNodeID != currentMaster && selfNodeID != ROOTID) {
+    DynamicJsonDocument doc(1024);
+    doc["distance"] = 123;
+    String msg;
+    serializeJson(doc, msg);
+    mesh.sendSingle(currentMaster, msg);
+  }
+}
+void communicateWithNodes() {
+  Serial.printf("Node ID is:%u\n", selfNodeID);
+  Serial.printf("Node Time is:%uus\n", mesh.getNodeTime()); //in us
+  if (selfNodeID != ROOTID) {
+    if (currentMaster == selfNodeID) {
+      DynamicJsonDocument doc(1024);
+      doc["MSG"] = "I am slave";
+      String msg;
+      char data[100];
+      sprintf(data, "%s:SPEED,%d\n", ownMAC, millis());
+      doc["Print"] = data;
+      serializeJson(doc, msg);
+      //mesh.sendBroadcast(msg);
+      Serial.println("I am master");
+    }
+    else {
+      char data[100];
+      sprintf(data, "%s:SPEED,%d\n", ownMAC, millis());
+      //sendToRoot(data);
+    }
+  }
+  printNodeList();
+  printMeshTopology();
+}
+void sendToRoot(char data[]) {
+  if (selfNodeID != ROOTID) {
+    DynamicJsonDocument doc(1024);
+    doc["Print"] = data;
+    String msg;
+    serializeJson(doc, msg);
+    mesh.sendSingle(ROOTID, msg);
+    Serial.println(data);
+  }
+}
+void addSelfToNodeList() {
+  nodeList[0] = selfNodeID;
+  currentNodeCount = 1;
+}
+void updateNodeList() {
+  addSelfToNodeList();
+  std::list <uint32_t> NodeList = mesh.getNodeList();
+  std::list <uint32_t> :: iterator it;
+  for (it = NodeList.begin(); it != NodeList.end(); ++it) {
+    nodeList[currentNodeCount] = *it;
+    currentNodeCount++;
+  }
+}
+void printNodeList() {
+  Serial.printf("%d existing nodes:\n", currentNodeCount);
+  for (int x = 0; x < currentNodeCount; x++) {
+    Serial.println(nodeList[x]);
+  }
+}
+void printMeshTopology() {
+  Serial.println(mesh.subConnectionJson());
+}
+void selectMaster() {
+  uint32_t largest = selfNodeID;
+  if (selfNodeID == ROOTID) { //if own self is ROOTID
+    for (int x = 0; x < currentNodeCount; x++) {
+      if (nodeList[x] < largest && nodeList[x] != ROOTID)
+        largest = nodeList[x];  //select the smallest NodeID excluding self
+    }
+  }
+  /*If ROOTID is the only one in the list, then ROOTID will be its own master*/
+  for (int x = 0; x < currentNodeCount; x++) {
+    if (nodeList[x] > largest && nodeList[x] != ROOTID)
+      largest = nodeList[x];  //select largest ID as master excluding root
+  }
+  currentMaster = largest;
+  Serial.printf("Current Master:%u\n", currentMaster);
+}
+int findNode(uint32_t node){
+  for(int i=0;i<currentNodeCount;i++){
+    if(node == nodeCount[i])
+      return i;
+  }
+  return -1;
+}
+/*End of Mesh Codes-----------------------------------------------------------*/
+/*Location Finder Code--------------------------------------------------------*/
+#define TIMEOUT_PERIOD 30000  //ms
+#define MOVE_DISTANCE 1       //meter
+
+bool mode_front = 1;
+bool found_Master = 0;
+
+typedef struct {
+  uint32_t mac;
+  float prevDistance = 0;
+  float currDistance = 0;
+  uint32_t prevTime = 0;
+} swarmDistance;      //wifi into structure/map
+
+swarmDistance availableDistance[WIFI_MAX];
+int swarmStored = 0;
+
+Task readLocate(0,TASK_ONCE,&Locate);
+
+int searchForMAC(uint32_t MAC){
+  for(int i=0;i<swarmStored;i++){ //iterate through list of stored swarmDistance data
+    if (availableDistance[i].mac == MAC){ //if found wanted Mac from list
+      return i; //return the index of the mac in the list
+    }
+  }
+  return -1; //if not found, return -1
+}
+
+void clearLocate(){
+    memset(availableDistance, (char)0, WIFI_MAX); //clears all previous wifi info
+}
+
+int FaceTarget(uint32_t target){
+  int index = searchForMAC(target);
+  if(index >= 0){
+    if(availableDistance[index].currDistance < 1.0){
+      found_Master = 1;
+    }
+    else{
+      found_Master = 0;
+    }
+    if(mode_front){
+      float angle;
+      angle = calcAngle(availableDistance[index].prevDistance,availableDistance[index].currDistance);
+      angleToRotate = (float)(180.0 - angle);
+      PID_Rotate();
+    }
+    else{
+      float angle;
+      angle = calcAngle(availableDistance[index].prevDistance,availableDistance[index].currDistance);
+      angleToRotate = angle;
+      PID_Rotate();
+    }
+    return 1;
+  }
+  else
+    return -1;
+}
+
+void Locate(){
+  for(int i=0;i<swarmNetworks;i++){ //for every swarm network detected
+    int index = searchForMAC(availableNetworks[i].intmac);
+    if(index >= 0){ //if found, value will be 0 or higher
+      if(availableDistance[index].prevTime != 0 && (millis()-availableDistance[index].prevTime) < TIMEOUT_PERIOD){  //if not first time data, or past time out, can calc angle here
+        availableDistance[index].prevDistance = availableDistance[index].currDistance;  //store previous distance
+        availableDistance[index].currDistance = availableNetworks[i].distance;      //overwrite with current distance
+        availableDistance[index].prevTime = millis();  //restart timer
+      }
+      else{ //if first time data, or if timed out, restore as first time data (even though should be impossible to be first time data here) cnt calc angle
+        availableDistance[index].currDistance = availableNetworks[i].distance;
+        availableDistance[index].prevTime = millis();
+      }
+    }
+    else{ //if first time data, not found inside list of stored data
+      availableDistance[swarmStored].mac = availableNetworks[i].intmac;
+      availableDistance[swarmStored].currDistance = availableNetworks[i].distance;  //store current distance
+      availableDistance[swarmStored].prevTime = millis(); //start timer
+      swarmStored++;  //started list from index of 0, if added new mac, plus 1
+    }
+  }
+  
+  Serial.printf("Swarm stored:%d\n",swarmStored);
+  for(int i=0;i<swarmStored;i++){
+    Serial.printf("MAC:%u,Prv:%4.2f,Cur:%4.2f\n",availableDistance[i].mac,availableDistance[i].prevDistance,availableDistance[i].currDistance);
+  }
+}
+
+/* Angle calculated using trigonometry rules
+ * A,B,C are angles; a,b,c are lengths of triangle sides
+ * a: distance between self and target at 2nd position (moved 1 meter)
+ * b: distance self moved from original position to new position
+ * c: distance between self and target at original position
+ * A: angle between b and c (original position)
+ * B: angle between a and c (target position)
+ * C: angle between a and b (moved position)
+ * C = (a^2 + b^2 - c^2)/2(a*b)
+ * Triangle rule:
+ * any sum of 2 side must be longer than 3rd side
+ * a + b > c, a + c > b, b + c > a
+ * Note: C is the angle to be found so that target is located
+ */
+float calcAngle(float &prev, float &curr){  //prev is distance before moved (c), curr is after (a)
+  float b = (float)MOVE_DISTANCE;
+  if(abs(curr-prev) > b){ //impossible to move more than b, or set MOVE_DISTANCE
+    if(curr > prev)
+      curr = prev + 1;
+    else
+      curr = prev - 1;
+  }
+  //if Triangle rule is broken, then adjust prev n curr value
+  while((prev + b) <= curr || (curr + b) <= prev || (prev + curr) <= b){
+    if((prev + b) <= curr){
+      float diff = curr - (prev + b);
+      diff = diff*1.2;
+      float adjcurr =curr - diff/2;
+      float adjprev = prev + diff/2;
+      curr = adjcurr; prev = adjprev;
+    }
+    if((curr + b) <= prev){
+      float diff = prev - (curr + b);
+      diff = diff*1.2;
+      float adjcurr = curr + diff/2;
+      float adjprev = prev - diff/2;
+      curr = adjcurr; prev = adjprev;
+    }
+    if((prev + curr) <= b){
+      float diff = b - (prev + curr);
+      diff = diff*1.2;
+      float adjcurr = curr + diff/2;
+      float adjprev = prev + diff/2;
+      if(adjcurr = adjprev)
+        adjcurr += 0.1;
+      curr = adjcurr; prev = adjprev;
+    }
+//    if((prev + b)< curr){
+//      float diff = curr - (prev + b); //curr is longest (too long), or prev too short
+//      diff = diff*1.1;
+//      float adjcurr = diff*abs(log(curr)/log(10));
+//      adjcurr = curr - adjcurr;
+//      float adjprev = diff*abs(log(prev)/log(10));
+//      adjprev = prev + adjprev;
+//      curr = adjcurr; prev = adjprev;
+//    }
+    yield();
+  }
+  float ans;
+  ans = pow(curr,2) + pow(b,2) - pow(prev,2); //MOVE_DISTANCE is b, so a^2 + b^2 - c^2
+  ans = ans/(2*curr*b); //divide by 2(a)(b)
+  ans = acos(ans);
+  ans = ans*57.2957795; //convert to degree
+  Serial.printf("Adjprev:% 4.2f, Adjcurr:% 4.2f\n",prev,curr);
+  Serial.printf("Angle is:% 4.2f\n",ans);
+  char data[100];
+  sprintf(data, "%u:,%u,prev:% 4.2f,curr:% 4.2f,angle:% 4.2f\n\0", ownintMAC,  prev, curr, ans);
+  sendToRoot(data);
+  return ans;
+}
+/*End of Location Finder Code-------------------------------------------------*/
+/*Master Code-----------------------------------------------------------------*/
+Task master(10,TASK_FOREVER,&Master);
+
+long int startup_timer = 0;
+
+long int wait_time = 0;
+int Master(){
+  if(millis() - startup_timer < 10000){ //wait 10 sec
+    return 0;
+  }
+  if(currentMaster == selfNodeID){
+    if(step_counter == 0){
+      waitForNodes(); //wait for all units
+    }
+    if(step_counter == 1){
+      if(!startScan){  //if havent started scan, start scanning WiFi
+        scanNodes.restart();
+        Serial.println(startScan);
+      }
+      if(getScan){    //if WiFi scanning done and saved WiFi details
+        startScan = 0;
+        getScan = 0;
+        step_counter = 0;
+      }
+    }
+  }
+  else if(found_Master == 0){
+   if(step_counter == 0){
+      if(!startScan){  //if havent started scan, start scanning WiFi
+        scanNodes.restart();
+        Serial.println(startScan);
+      }
+      if(getScan){    //if WiFi scanning done and saved WiFi details
+        startScan = 0;
+        getScan = 0;
+        pingMaster();
+        step_counter++;
+      }
+    }
+    if(step_counter == 1){
+      waitForMaster();
+    }
+    if(step_counter == 2){
+      if(mode_front)
+        PID_Forward();
+      else
+        PID_Backward();
+      step_counter++;
+    }
+    if(step_counter == 3){
+      if(wait_time == 0){
+        wait_time = millis();
+      }
+      else if((millis() - wait_time) >= 3000){
+        if(!startScan){  //if havent started scan, start scanning WiFi
+          scanNodes.restart();
+          Serial.println(startScan);
+        }
+        if(getScan){    //if WiFi scanning done and saved WiFi details
+          startScan = 0;
+          getScan = 0;
+          pingMaster();
+          step_counter++;
+        }
+      }
+    }
+    if(step_counter == 4){
+      waitForMaster();
+    }
+    if(step_counter == 5){
+      FaceTarget(currentMaster);
+      if(found_Master){
+       return 0; 
+      }
+      step_counter++;
+    }
+    if(step_counter == 6){
+      PID_Forward();
+      step_counter++;
+    }
+    if(step_counter == 7){
+      if(wait_time == 0){
+        wait_time = millis();
+      }
+      else if((millis() - wait_time) >= 3000){
+        PID_North();
+        mode_front = !mode_front;
+        step_counter = 0;
+      }
+    }
+  }
+}
+/*End of Master Code--------------------=-------------------------------------*/
+/*Utility Code----------------------------------------------------------------*/
+// Select SDA and SCL pins for I2C communication
+const uint8_t scl = D1;
+const uint8_t sda = D3;
+
+void Serial_Setup() {
+  if (SERIAL)
+    Serial.begin(115200);
+  if (SERIAL_GPIO)
+    TXRX_to_GPIO();
+  else
+    TXRX_to_DEFAULT();
+}
+void I2C_Setup() {
+  if (I2C_COM)
+    Wire.begin(sda, scl);
+}
+/*End of Utility Code---------------------------------------------------------*/
+/*Main Code-------------------------------------------------------------------*/
+void setup() {
+  delay(1000);
+  Serial_Setup();
+  if (!isROOT) {
+    I2C_Setup();
+    BATTERY_Setup();
+    BUTTON_Setup();
+    ENCODER_Setup();
+    PID_MOTOR_Setup();
+    QMC5883L_Setup();
+    MPU6050_Setup();
+    FUSION_Setup();
+    if(STARTUP_NORTH){
+      PID_North();
+    }
+    mesh_Setup();
+    WiFi_Setup();
+  }
+  else {
+    mesh_Setup();
+    WiFi_Setup();
+    WebSocket_Setup(); 
+  }
+  startup_timer = millis();
+  taskScheduler.addTask(master);
+  master.enable();
+}
+
+void loop() {
+  taskScheduler.execute();
+  if (MESHNETWORK) {
+    mesh.update();
+  }
+  if (WEBSOCKET) {
+    webSocket.loop();
+  }
+  B_Bump();
+}
+/*End of Main Code------------------------------------------------------------*/

@@ -9,8 +9,9 @@ public:
   void reconfig();
   
   float readHeading();
-  int readRaw( int16_t *x, int16_t *y, int16_t *z, int16_t *t );
+  int readRaw( int16_t *x, int16_t *y, int16_t *z);
   int readCal( int16_t *xmax, int16_t *xmin, int16_t *ymax, int16_t *ymin);
+  int readCalFull(int16_t *xmax, int16_t *xmin, int16_t *ymax, int16_t *ymin, int16_t *zmax, int16_t *zmin);
 
   void resetCalibration();
   void setCalibration(int16_t xmax,int16_t xmin,int16_t ymax,int16_t ymin);
@@ -22,6 +23,7 @@ public:
 private:
   int16_t xhigh, xlow;
   int16_t yhigh, ylow;
+  int16_t zhigh, zlow;
   uint8_t addr;
   uint8_t mode;
   uint8_t rate;

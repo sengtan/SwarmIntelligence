@@ -158,7 +158,7 @@ int QMC5883L::ready()
   return status & QMC5883L_STATUS_DRDY; 
 }
 
-int QMC5883L::readRaw( int16_t *x, int16_t *y, int16_t *z, int16_t *t )
+int QMC5883L::readRaw( int16_t *x, int16_t *y, int16_t *z )
 {
   while(!ready()) {}
 
@@ -181,6 +181,17 @@ int QMC5883L::readCal(int16_t *xmax, int16_t *xmin, int16_t *ymax, int16_t *ymin
   return 1;
 }
 
+int QMC5883L::readCalFull(int16_t *xmax, int16_t *xmin, int16_t *ymax, int16_t *ymin, int16_t *zmax, int16_t *zmin)
+{
+  *xmax = xhigh;
+  *xmin = xlow;
+  *ymax = yhigh;
+  *ymin = ylow;
+  *zmax = zhigh;
+  *zmin = zlow;
+  return 1;
+}
+
 void QMC5883L::resetCalibration() {
   autocal = 1;
   config = 0;
@@ -200,9 +211,9 @@ void QMC5883L::setCalibration(int16_t xmax, int16_t xmin, int16_t ymax, int16_t 
 
 float QMC5883L::readHeading()
 {
-  int16_t x, y, z, t;
+  int16_t x, y, z;
 
-  if(!readRaw(&x,&y,&z,&t)) return 0;
+  if(!readRaw(&x,&y,&z)) return 0;
 
   /* Update the observed boundaries of the measurements */
   if(autocal){
@@ -210,18 +221,21 @@ float QMC5883L::readHeading()
 	if(x>xhigh) xhigh = x;
 	if(y<ylow) ylow = y;
 	if(y>yhigh) yhigh = y;
+	if(z<zlow) zlow = z;
+	if(z>zhigh) zhigh = z;
   }
   /* Bail out if not enough data is available. */
   
-  if(autocal){
-  	if( xlow==xhigh || ylow==yhigh ) return 0;
-  }
+//  if(autocal){
+//  	if( xlow==xhigh || ylow==yhigh ) return 0;
+//  }
 
   /* Recenter the measurement by subtracting the average */
 
   if(autocal||config){
   	x -= (xhigh+xlow)/2;
   	y -= (yhigh+ylow)/2;
+  	z -= (zhigh+zlow)/2;
   }
 
   /* Rescale the measurement to the range observed. */
