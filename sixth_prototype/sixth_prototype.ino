@@ -41,7 +41,7 @@
 
 //Async Server & WebSocket Controlsrpm
 #define ASYNCSERVER 0       //for setup of AsyncWebServer
-#define WEBSOCKET   0       //for setup of WebSocket
+#define WEBSOCKET   1       //for setup of WebSocket
 
 //Mesh Controls
 #define MESHNETWORK 1       //for setup of Mesh network z
@@ -53,17 +53,17 @@ bool isROOT = 0;
 #define BATTERYREADER   0   //for detecting battery voltage & percent z
 
 //QMC5883L Controls
-#define QMC5883LMODULE  1   //for setup of compass module
+#define QMC5883LMODULE  0   //for setup of compass module
 #define QMC5883LPRINT   0   //for printing out values
 #define QMC_MANUAL_CAL  0   //specify if manual calibration set
-#define QMC_AUTO_CAL    1   //specify if robot calibrates itself by rotating
+#define QMC_AUTO_CAL    0   //specify if robot calibrates itself by rotating
 
 //MPU6050 Controls
-#define MPU6050MODULE   1   //for setup of MPU6050 module
+#define MPU6050MODULE   0   //for setup of MPU6050 module
 #define MPU6050PRINT    0   //for printing out values
 
 //Sensor Fusion Controls
-#define FUSION          1   //for setup of fusion data for MPU6050 and QMC5883L
+#define FUSION          0   //for setup of fusion data for MPU6050 and QMC5883L
 #define FUSIONPRINT     0   //for printing out values
 #define FUSIONRAW       1   //to output raw data
 #define FUSIONTILT      1   //to calculate data compensated with tilt
@@ -73,8 +73,8 @@ bool isROOT = 0;
 
 //PCF8574 Controls
 #define PCF8574MODULE   1   //for setup of PCF8574 IO Extender
-#define PCF8574LED0     1   //to auto blink led 0
-#define PCF8574LED1     1   //to auto blink led 1
+#define PCF8574LED0     0   //to auto blink led 0
+#define PCF8574LED1     0   //to auto blink led 1
 
 //Encoder Controls
 #define ENCODER_L 1         //for enabling Left encoder on pin D2   z
@@ -84,18 +84,29 @@ bool isROOT = 0;
 #define PID_CONTINUOUS  1   //for testing PID algorithm on continuous wheel
 
 //Motor Controls
-#define MOTOR_CONTROL_L 1   //for enabling/disabling left motor
-#define MOTOR_CONTROL_R 1   //for enabling/disabling right motor
-#define STARTUP_NORTH   1   //to auto turn to North on startup
+#define MOTOR_CONTROL_L 0   //for enabling/disabling left motor
+#define MOTOR_CONTROL_R 0   //for enabling/disabling right motor
+#define STARTUP_NORTH   0   //to auto turn to North on startup
 
 //Bump Button Controls
 #define BUMP_L  1           //for enabling bump sensor on D4  z
 #define BUMP_R  0           //for enabling bump sensor on TX  z
 #define BUMP_B  1           //for enabling bump sensor on D0  z
 
+//Matrix Controls
+#define MATRIX  1           //for enabling Matrix movement
 /*Global Variables*/
 #define M_PI 3.14159265358979323846264338327950288
 Scheduler taskScheduler;
+
+volatile bool START = 0;
+volatile bool gotoRoot = 0;
+volatile bool foundNodes = 0;
+volatile bool foundRoot = 0;
+long int mesh_timer = 0;
+volatile float currentDegree = 0;
+volatile int movedTss = 0;
+volatile bool MATRIX_bumped = 0;
 
 volatile int step_counter = 0;
 volatile bool getBattery = 0;
@@ -622,6 +633,8 @@ Task PCF_Blink1(1000,TASK_FOREVER,&blink_LED1);
 void PCF8574_Setup(){
   if(PCF8574MODULE){
     PCF.begin(0xFF);  //initialize all pins to HIGH
+    LED_0(0); //initially off
+    LED_1(0); //initially off
     if(PCF8574LED0){
       taskScheduler.addTask(PCF_Blink0);
       PCF_Blink0.enable();
@@ -633,10 +646,10 @@ void PCF8574_Setup(){
   }
 }
 void LED_0(int value){
-  PCF.write(0,value); //0-1024
+  PCF.write(0,value); //0-1023
 }
 void LED_1(int value){
-  PCF.write(1,value); //0-1024
+  PCF.write(1,value); //0-1023
 }
 void Buzzer(int value){
   PCF.write(2,value); //0 or 1
@@ -766,48 +779,45 @@ const uint8_t B_BUT = D0;
 volatile unsigned long L_b_micros = 0, R_b_micros = 0, B_b_micros; //for managing debounce
 volatile bool  L_bumped = 0, R_bumped = 0, B_bumped = 0, F_bumped = 0;
 
-Task PID_B_left(0, TASK_ONCE, &PID_B_Left);
-Task PID_B_right(0, TASK_ONCE, &PID_B_Right);
-Task PID_B_front(0, TASK_ONCE, &PID_B_Front);
-Task PID_B_back(0, TASK_ONCE, &PID_B_Back);
+Task PID_B_left(0, TASK_ONCE, &MATRIX_Bump);
+Task PID_B_right(0, TASK_ONCE, &MATRIX_Bump);
+Task PID_B_front(0, TASK_ONCE, &MATRIX_Bump);
+Task PID_B_back(0, TASK_ONCE, &MATRIX_Bump);
 
 void clearLocate();
 void ICACHE_RAM_ATTR L_Bump() {
   if ((long)(micros() - L_b_micros) >= debounceVal * 1000) {
     if(digitalRead(L_BUT) && digitalRead(R_BUT)){
       F_bumped = 1;
-      PID_B_front.restart();
+      //PID_B_front.restart();
     }
     else{
       L_bumped = 1;
-      PID_B_left.restart();
+      //PID_B_left.restart();
     }
     L_b_micros = micros();
-    step_counter = 0;
   }
 }
 void ICACHE_RAM_ATTR R_Bump() {
   if ((long)(micros() - R_b_micros) >= debounceVal * 1000) {
     if(digitalRead(L_BUT) && digitalRead(R_BUT)){
       F_bumped = 1;
-      PID_B_front.restart();
+      //PID_B_front.restart();
     }
     else{
       R_bumped = 1;
-      PID_B_right.restart();
+      //PID_B_right.restart();
     }
     R_b_micros = micros();
-    step_counter = 0;
   }
 }
 void B_Bump() {
-  if (BUMP_B) {
+  if (BUMP_B && !isROOT) {
     if (digitalRead(B_BUT)) {
       if ((long)(micros() - L_b_micros) >= debounceVal * 1000) {
         B_bumped = 1;
-        PID_B_back.restart();
+        //PID_B_back.restart();
         B_b_micros = micros();
-        step_counter = 0;
       }
     }
   }
@@ -1025,12 +1035,8 @@ void PID_Forward() {
     //sendToRoot(data);
     yield();
   }
-  if(L_bumped || R_bumped || F_bumped){
+  if(L_bumped || R_bumped || F_bumped || B_bumped){
     movedTss = (float)(L_tss + R_tss)/2;
-  }
-  else if(B_bumped){
-    movedTss = (float)(L_tss + R_tss)/2;
-    movedTss = movedTss*(-1.0);
   }
   donetime = millis() - donetime;
   digitalWrite(M1B, 0); digitalWrite(M2B, 0);
@@ -1109,6 +1115,9 @@ void PID_Backward() {
     //sprintf(data,"%s:L_TP,%f,R_TP,%f,%d\n","MOVINGGUY",tempL,tempR,L_tss);
     //sendToRoot(data);
     yield();
+  }
+  if(L_bumped || R_bumped || F_bumped || B_bumped){
+    movedTss = (float)(L_tss + R_tss)/2;
   }
   donetime = millis() - donetime;
   digitalWrite(M1B, 0); digitalWrite(M2B, 0);
@@ -1312,6 +1321,24 @@ void PID_Cali_Rotate() {
   Serial.printf("Total time taken:%d\n", donetime);
   ENCODER_reset();  //reset values
 }
+void PID_RotateTo(float angle){
+  if(currentDegree != angle){
+    if(currentDegree > angle){
+      angle += 360;
+    }
+    angleToRotate = angle - currentDegree;
+    PID_Rotate();
+  }
+}
+void PID_MoveTo(float distance){
+  if(distance > 0){
+    distanceToMove = distance;
+    PID_Forward();
+  }
+  else if(distance <0){
+    PID_Backward();
+  }
+}
 void PID_North(){
   FUSION_read();      //read MPU6050 and magnetometer values
   delay(10);          //to let some time pass
@@ -1479,9 +1506,9 @@ void saveNetwork() {
               tempMACnum++;
             }
           }
-          availableNetworks[swarmNetworks].mac[tempMACnum] = '\0';
-          concatMAC[8] = '\0';
-          availableNetworks[swarmNetworks].intmac = strtoul(concatMAC,NULL,16);
+          availableNetworks[swarmNetworks].mac[tempMACnum] = '\0';  //add delimiter to make mac into string
+          concatMAC[8] = '\0';  //add delimiter to make mac into string (used for int instead)
+          availableNetworks[swarmNetworks].intmac = strtoul(concatMAC,NULL,16); //convert into integer
           Serial.printf("CONVERTED:%u\n",availableNetworks[swarmNetworks].intmac);
           /*Sort the collected Swarm macs according to RSSI in descending order*/
           if (swarmNetworks > 0) { //only start sorting after at least 2 data stored, sorts every i increment (on every new network added)
@@ -1507,7 +1534,7 @@ void saveNetwork() {
         }
       }
       Serial.println(",AUTOSCROLL_20"); //to autoscroll excel sheet and go to next line
-      Locate();
+      //Locate();
     }
     else { //Stores all known SSIDs
       Serial.printf("%d networks found\n", networksFound);
@@ -1605,8 +1632,8 @@ void WebSocket_Setup() {
     webSocket.onEvent(webSocketEvent);
     webSocket.begin();
     taskScheduler.addTask(sendThings);
-    sendThings.enable();
-    sendThings.restart();
+//    sendThings.enable();
+//    sendThings.restart();
   }
 }
 
@@ -1626,13 +1653,26 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t lenght
       break;
     case WStype_TEXT:                     // if new text data is received
       Serial.printf("[%u] get Text: %s\n", num, payload);
+      if(lenght == 1){  //only accepts 1 char, if more then data error
+        Serial.printf("%s\n",payload);
+        if(payload[0] == 'Y'){
+          step_counter = 0;
+          mesh_timer = millis();
+          START = 1;
+          sendStart();
+        }
+        else if(payload[0] == 'Z'){
+          START = 0;
+          sendStop();
+        }
+      }
       break;
   }
 }
 
 void sendTestData() {
   char data[100];
-  sprintf(data, "%s:Sample,%d\n", ownMAC, millis());
+  sprintf(data, "%d:Sample,%d\n", ownintMAC, millis());
   webSocket.broadcastTXT(data);
   Serial.printf("Sent Socket,%s", data);
 }
@@ -1657,19 +1697,16 @@ int current_step = 0;
 int head_count = 0;
 uint32_t nodeCount[10];
 bool node_move = 0;
-long int mesh_timer = 0;
 
 painlessMesh mesh;
-
-Task communicate(0, TASK_ONCE, &communicateWithNodes);
 
 void mesh_Setup() {
   if (MESHNETWORK) {
     mesh.setDebugMsgTypes( ERROR | STARTUP | CONNECTION );  // set before init() so that you can see startup messages
     mesh.init(MESH_SSID, MESH_PASSWORD, &taskScheduler, MESH_PORT, WIFI_AP_STA, 6);
-    mesh.onReceive(&sync);
-    mesh.onNewConnection(&newConnectionCallback);
-    mesh.onChangedConnections(&onChangedConnections);
+    mesh.onReceive(&onReceiveCallback);
+    //mesh.onNewConnection(&newConnectionCallback);
+    mesh.onChangedConnections(&onChangedConnectionsCallback);
     mesh.setRoot(false);
     mesh.setContainsRoot(true);
 
@@ -1679,114 +1716,84 @@ void mesh_Setup() {
       mesh.stationManual(STATION_SSID, STATION_PASSWORD); //connect hotspot
       mesh.setHostname(HOSTNAME);
       mesh.setRoot(true);
+      Serial.println("I AM ROOT");
     }
 
     selfNodeID = mesh.getNodeId();
     currentMaster = selfNodeID;
     addSelfToNodeList();
-
-    taskScheduler.addTask(communicate);
-    //communicate.enable();
   }
 }
 void newConnectionCallback(uint32_t nodeID) {
   updateNodeList();
   printNodeList();
-  selectMaster();
-  step_counter = 0;
 }
-void onChangedConnections() {
+void onChangedConnectionsCallback() {
   updateNodeList();
   printNodeList();
-  selectMaster();
-  step_counter = 0;
 }
-void sync(uint32_t from, String &msg) {
+void onReceiveCallback(uint32_t from, String &msg) {
+  Serial.println("RECEIVED");
   String json;
   DynamicJsonDocument doc(1024);
   json = msg.c_str();
-  DeserializationError error = deserializeJson(doc, json);
-  if (error)
-  {
-    Serial.print("deserializeJson() failed: ");
-    Serial.println(error.c_str());
-  }
-  if (selfNodeID != ROOTID) {
-    if (currentMaster == selfNodeID) {
-      if(findNode(from) < 0){
-        nodeCount[head_count] = from;
-        head_count++;
+  deserializeJson(doc, json);
+  if(from == ROOTID){ //if message is from root
+    if(selfNodeID != ROOTID){ //if self is not root
+      bool command = doc["START"];
+      if(START != command){  //if root is only sending command from app
+        START = doc["START"];
+        step_counter = 0;
       }
-    }
-    else {
-      if(from == currentMaster){
-        current_step = doc["current_step"];
-        node_move = 1;
+      else{ //if root is replying nodes
+        step_counter++;
       }
     }
   }
-  else {
-    String text = doc["Print"];
-    sendNodeData(text);
+  else{ //if message is to root
+    if(findNode(from) < 0){
+      nodeCount[head_count] = from; //store in known list
+      head_count++;
+      mesh_timer = millis();
+      Serial.println(head_count);
+      float dis = doc["distance"];
+      char data[100];
+      sprintf(data, "%u:distance,%4.2f\n",from, dis);
+      sendNodeData(data);
+    }
   }
 }
 void waitForNodes(){
-  if( ( (currentNodeCount > 1) && (head_count >= (currentNodeCount - 1) ) || ( (millis() - mesh_timer)>MESH_TIMEOUT) )){  //currentNodeCount - 1 because master counts as 1
+  if( ( (currentNodeCount > 1) && (head_count >= (currentNodeCount - 1) ) ) || ((millis()-mesh_timer)>MESH_TIMEOUT) ){  //currentNodeCount - 1 because master counts as 1
     for(int i=0;i<head_count;i++){
       nodeCount[i] = 0;
     }
     head_count = 0;
-    
-    current_step++;
-    if(current_step > 5){
-      current_step = 0;
-    }
-    DynamicJsonDocument doc(1024);
-    doc["current_step"] = current_step;
-    String msg;
-    serializeJson(doc,msg);
-    mesh.sendBroadcast(msg);
     step_counter++;
-    mesh_timer = millis();
   }
-}
-void waitForMaster(){
-  if(node_move == 1){
+  else if(currentNodeCount == 1){ //if currently only root exist
     step_counter++;
   }
 }
-void pingMaster(){
-  if (selfNodeID != currentMaster && selfNodeID != ROOTID) {
+void pingNodes(){
+  DynamicJsonDocument doc(1024);
+  doc["START"] = 1;
+  String msg;
+  serializeJson(doc,msg);
+  mesh.sendBroadcast(msg);
+  mesh_timer = millis();
+}
+void waitForRoot(){
+  LED_0(1);
+}
+void pingRoot(){
+  if (selfNodeID != ROOTID) {
     DynamicJsonDocument doc(1024);
-    doc["distance"] = 123;
+    doc["distance"] = availableNetworks[0].distance;
     String msg;
     serializeJson(doc, msg);
-    mesh.sendSingle(currentMaster, msg);
+    mesh.sendSingle(ROOTID, msg);
   }
-}
-void communicateWithNodes() {
-  Serial.printf("Node ID is:%u\n", selfNodeID);
-  Serial.printf("Node Time is:%uus\n", mesh.getNodeTime()); //in us
-  if (selfNodeID != ROOTID) {
-    if (currentMaster == selfNodeID) {
-      DynamicJsonDocument doc(1024);
-      doc["MSG"] = "I am slave";
-      String msg;
-      char data[100];
-      sprintf(data, "%s:SPEED,%d\n", ownMAC, millis());
-      doc["Print"] = data;
-      serializeJson(doc, msg);
-      //mesh.sendBroadcast(msg);
-      Serial.println("I am master");
-    }
-    else {
-      char data[100];
-      sprintf(data, "%s:SPEED,%d\n", ownMAC, millis());
-      //sendToRoot(data);
-    }
-  }
-  printNodeList();
-  printMeshTopology();
 }
 void sendToRoot(char data[]) {
   if (selfNodeID != ROOTID) {
@@ -1842,6 +1849,20 @@ int findNode(uint32_t node){
       return i;
   }
   return -1;
+}
+void sendStart(){
+  DynamicJsonDocument doc(1024);
+  doc["START"] = 1;
+  String msg;
+  serializeJson(doc,msg);
+  mesh.sendBroadcast(msg);
+}
+void sendStop(){
+  DynamicJsonDocument doc(1024);
+  doc["START"] = 0;
+  String msg;
+  serializeJson(doc,msg);
+  mesh.sendBroadcast(msg);
 }
 /*End of Mesh Codes-----------------------------------------------------------*/
 /*Location Finder Code--------------------------------------------------------*/
@@ -2002,6 +2023,475 @@ float calcAngle(float &prev, float &curr){  //prev is distance before moved (c),
   return ans;
 }
 /*End of Location Finder Code-------------------------------------------------*/
+/*ACO Movement Code-----------------------------------------------------------*/
+/* 
+ * Movement Matrix
+ * [1][2][3]
+ * [4][5][6]
+ * [7][8][9]
+ * Direction Matrix
+ * [-1,-1][-1, 0][-1,+1]
+ * [ 0,-1][ 0, 0][ 0,+1]
+ * [+1,-1][+1, 0][+1,+1]
+ */
+#define height 21
+#define width 21
+#define initialPheromone 1
+const float MATRIX_LENGTH = 100; //1 meter
+const float MATRIX_DIAGONAL = 141; //1.414 meter
+float matrix[width][height];
+float rootmatrix[width][height];
+int currX, currY, nextX, nextY, prevX, prevY;
+float prevVis = 0,currVis = 0;
+float prevRootVis = 0, currRootVis = 0;
+int MATRIX_direction = 0;
+
+void MATRIX_Setup(){
+  if(MATRIX){
+    currX = round((float)height/2) - 1; //middle, -1 because array starts from 0
+    currY = round((float)width/2) - 1;
+    MATRIX_reset(matrix);
+    MATRIX_reset(rootmatrix);
+    Serial.println("Node Matrix:");
+    MATRIX_print(matrix);
+    Serial.println("Root Matrix:");
+    MATRIX_print(rootmatrix);
+    currentDegree = 0;
+  }
+}
+void MATRIX_move(int directions){
+  Serial.printf("Direction:%d\n",directions);
+  float angle, distance;
+  switch(directions){
+    case 1: angle = 315;distance = MATRIX_DIAGONAL; nextX = currX-1; nextY = currY-1;break;
+    case 2: angle = 0;  distance = MATRIX_LENGTH;   nextX = currX-1; nextY = currY-0;break;
+    case 3: angle = 45; distance = MATRIX_DIAGONAL; nextX = currX-1; nextY = currY+1;break;
+    case 4: angle = 270;distance = MATRIX_LENGTH;   nextX = currX-0; nextY = currY-1;break;
+    case 6: angle = 90; distance = MATRIX_LENGTH;   nextX = currX-0; nextY = currY+1;break;
+    case 7: angle = 225;distance = MATRIX_DIAGONAL; nextX = currX+1; nextY = currY-1;break;
+    case 8: angle = 180;distance = MATRIX_LENGTH;   nextX = currX+1; nextY = currY-0;break;
+    case 9: angle = 135;distance = MATRIX_DIAGONAL; nextX = currX+1; nextY = currY+1;break;
+  }
+  Serial.printf("CurrX:%d,CurrY:%d,NextX:%d,NextY:%d\n",currX,currY,nextX,nextY);
+  if(directions != 5){
+    //PID_RotateTo(angle);
+    //currentDegree = angle;
+    //PID_MoveTo(distance);
+  }
+  if(MATRIX_bumped){  //if previously bumpped, then robot move back to prev position
+    matrix[nextX][nextY] = -1;  //-1 means there is obstacle
+  }
+  else{ //update current position
+    prevX = currX; prevY = currY;
+    currX = nextX; currY = nextY;
+  }
+}
+//pheromone = {1,2,3,4,6,7,8,9};  //data stored in that order
+void MATRIX_selectdirection(){
+  float pheromone[8];
+  float probability[8];
+  //shift coordinate to top left, eg. (1,1) -> (0,0), (8,4) -> (7,3), (0,0) -> (-1,-1)
+  int x = currX - 1;
+  int y = currY - 1;
+  int datacount = 0;
+  bool allzero = 1;
+  float totalPheromone = 0;
+  //retrieve the pheromone of the 8 cells surrounding current coordinate, datacount should be 8 at the end
+  for(int i=0;i<3;i++){ //row
+    for(int j=0;j<3;j++){ //column
+      if( !( ((x+i) == currX) && ((y+j) == currY) ) ){ //do not take in pheromone of current coordinate
+        if( (x+i)>=0 && (y+j)>=0 && (x+i)<width && (y+j)<height ){  //if cell not out of bounds
+          pheromone[datacount] = matrix[x+i][y+j];  //store valid data including -1
+          if(pheromone[datacount] >= 0) //if data is not -1
+            totalPheromone += pheromone[datacount]; //sum of all pheromone value that is not -1
+        }
+        else{
+          pheromone[datacount] = -1.0;  //temporarily store as -1 for out of bounds cell
+        }
+        datacount++;
+      }
+    }
+  }
+  //calculate probability of each cell
+  for(int i=0;i<datacount;i++){ 
+    if(pheromone[i] >= 0){  //if data is valid, not obstacle (-1)
+      if(pheromone[i] == 0){//if data is 0
+        probability[i] = 0; //directly set probability as 0 to avoid dividing 0 by a number
+      }
+      else{ //if data is not 0 or -1
+        probability[i] = (pheromone[i]/totalPheromone)*100.0; //calculate probability in percentage
+      }
+    }
+    else{ //if data is -1, or suggest obstacle/out of bounds
+      probability[i] = 0; //directly set probability as 0 as those cells should not be considered
+    }
+  }
+  //checking if all surrounding cells are 0 probability, if it is, then robot is stuck
+  for(int i=0;i<datacount;i++){
+    if(probability[i] > 0){
+      allzero = 0;
+      break;  //if found at least 1 cell with non zero probability, exit loop
+    }
+  }
+  //using probability of each cell to decide direction of movement
+  if(!allzero){ //if at least 1 cell has non zero probability
+    int counter = 0;
+    while(1){
+      if(probability[counter] != 0){  //probability is not 0
+        randomSeed(millis()); //set a random seed using current time
+        int randnum = random(1,100);  //generate num between 1 and 100
+        if(randnum <= round(probability[counter])){ //round up and convert to int for easy comparison
+          MATRIX_direction = counter+1; //set direction to number of the cell
+          if(MATRIX_direction >=5)
+            MATRIX_direction++; //offset by 1, because 5 doesnt count
+          break;  //exit loop once direction found
+        }
+      }
+      counter++;
+      if(counter == 8)  //reset if already 8
+        counter = 0;
+    }
+  }
+  else{
+    randomSeed(millis()); //set a random seed using current time
+    MATRIX_direction = random(1,8); //randomly select a number between 1 and 8
+    if(MATRIX_direction >=5)
+      MATRIX_direction++; //offset by 1, because 5 doesnt count
+  }
+  //Print pheromones
+  Serial.printf("[ % 3.2f ][ % 3.2f ][ % 3.2f ]\n",pheromone[0],pheromone[1],pheromone[2]);
+  Serial.printf("[ % 3.2f ][ % 3.2f ][ % 3.2f ]\n",pheromone[3],     0      ,pheromone[4]);
+  Serial.printf("[ % 3.2f ][ % 3.2f ][ % 3.2f ]\n",pheromone[5],pheromone[6],pheromone[7]);
+  Serial.println("");
+  //Print probabilities
+  Serial.printf("[ % 3.2f ][ % 3.2f ][ % 3.2f ]\n",probability[0],probability[1],probability[2]);
+  Serial.printf("[ % 3.2f ][ % 3.2f ][ % 3.2f ]\n",probability[3],      0      ,probability[4]);
+  Serial.printf("[ % 3.2f ][ % 3.2f ][ % 3.2f ]\n",probability[5],probability[6],probability[7]);
+}
+void MATRIX_update(){
+  currVis = calcVisibility(); //if no nodes around, will get 0
+  currRootVis = calcRootVisibility(); //if root not around, will get 0
+  if(MATRIX_direction == 0){  //first move
+    matrix[currX][currY] += currVis;  //only update current square, because surrounding unknown
+    rootmatrix[currX][currY] += currRootVis;  //update for root also
+  }
+  else{ //if moved before, update pheromone according to direction moved
+    if(MATRIX_bumped){  //if bumped
+      if(currVis < 1 && currRootVis < 1){ //if either other nodes or root are not nearby, then consider obstacle
+        
+      }
+    }
+    else{ //if not bumped, then update, else do nothing
+      update_Pheromones();
+    }
+    MATRIX_bumped = 0;
+  }
+  Serial.println("Node Matrix:");
+  MATRIX_print(matrix);
+  Serial.println("Root Matrix:");
+  MATRIX_print(rootmatrix);
+}
+void update_Pheromones(){
+  float pheromone = 0;
+  int larger = 0, rootlarger = 0;
+  if(currVis == prevVis){ //if there are no nodes, or if same visibility
+    matrix[prevX][prevY] = 0.5*matrix[prevX][prevY];  //half the pheromone, so that try not to return to same place
+  }
+  else{
+    if(currVis > prevVis)
+      larger = 1;
+    switch(MATRIX_direction){
+      case 1: MATRIX_1(matrix,currVis,larger);break;
+      case 2: MATRIX_2(matrix,currVis,larger);break;
+      case 3: MATRIX_3(matrix,currVis,larger);break;
+      case 4: MATRIX_4(matrix,currVis,larger);break;
+      case 6: MATRIX_6(matrix,currVis,larger);break;
+      case 7: MATRIX_7(matrix,currVis,larger);break;
+      case 8: MATRIX_8(matrix,currVis,larger);break;
+      case 9: MATRIX_9(matrix,currVis,larger);break;
+    }
+  }
+  
+  if(currRootVis == prevRootVis){
+    rootmatrix[prevX][prevY] = 0.5*rootmatrix[prevX][prevY];  //half the pheromone, so that try not to return to same place
+  }
+  else{
+    if(currRootVis > prevRootVis)
+      rootlarger = 1;
+    switch(MATRIX_direction){
+      case 1: MATRIX_1(rootmatrix,currRootVis,rootlarger);break;
+      case 2: MATRIX_2(rootmatrix,currRootVis,rootlarger);break;
+      case 3: MATRIX_3(rootmatrix,currRootVis,rootlarger);break;
+      case 4: MATRIX_4(rootmatrix,currRootVis,rootlarger);break;
+      case 6: MATRIX_6(rootmatrix,currRootVis,rootlarger);break;
+      case 7: MATRIX_7(rootmatrix,currRootVis,rootlarger);break;
+      case 8: MATRIX_8(rootmatrix,currRootVis,rootlarger);break;
+      case 9: MATRIX_9(rootmatrix,currRootVis,rootlarger);break;
+    }
+  }
+}
+void MATRIX_1(float matrix[width][height],float pheromone, int larger){
+  if(larger){
+    int reference[5][5] = {
+      { 1, 1, 1, 0, 0},
+      { 1, 1, 0,-1, 0},
+      { 1, 0,-1,-1, 0}, //m
+      { 0,-1,-1,-1, 0},
+      { 0, 0, 0, 0, 0},
+    };      //m
+    MATRIX_updatemat(matrix, reference, pheromone, prevX, prevY);
+  }
+  else{
+    int reference[5][5] = {
+      {-1,-1,-1, 0, 0},
+      {-1,-1, 0, 1, 0},
+      {-1, 0, 1, 1, 0}, //m
+      { 0, 1, 1, 1, 0},
+      { 0, 0, 0, 0, 0}
+    };      //m
+    MATRIX_updatemat(matrix, reference, pheromone, prevX, prevY);
+  }
+}
+void MATRIX_2(float matrix[width][height],float pheromone, int larger){
+  if(larger){
+    int reference[5][5] = {
+      { 0, 1, 1, 1, 0},
+      { 0, 0, 1, 0, 0},
+      { 0,-1,-1,-1, 0}, //m
+      { 0,-1,-1,-1, 0},
+      { 0, 0, 0, 0, 0},
+    };      //m
+    MATRIX_updatemat(matrix, reference, pheromone, prevX, prevY);
+  }
+  else{
+    int reference[5][5] = {
+      { 0,-1,-1,-1, 0},
+      { 0,-1,-1,-1, 0},
+      { 0, 0, 1, 0, 0}, //m
+      { 0, 1, 1, 1, 0},
+      { 0, 0, 0, 0, 0}
+    };      //m
+    MATRIX_updatemat(matrix, reference, pheromone, prevX, prevY);
+  }
+}
+void MATRIX_3(float matrix[width][height],float pheromone, int larger){
+  if(larger){
+    int reference[5][5] = {
+      { 0, 0, 1, 1, 1},
+      { 0,-1, 0, 1, 1},
+      { 0,-1,-1, 0, 1}, //m
+      { 0,-1,-1,-1, 0},
+      { 0, 0, 0, 0, 0},
+    };      //m
+    MATRIX_updatemat(matrix, reference, pheromone, prevX, prevY);
+  }
+  else{
+    int reference[5][5] = {
+      { 0, 0,-1,-1,-1},
+      { 0, 1, 0,-1,-1},
+      { 0, 1, 1, 0,-1}, //m
+      { 0, 1, 1, 1, 0},
+      { 0, 0, 0, 0, 0}
+    };      //m
+    MATRIX_updatemat(matrix, reference, pheromone, prevX, prevY);
+  }
+}
+void MATRIX_4(float matrix[width][height],float pheromone, int larger){
+  if(larger){
+    int reference[5][5] = {
+      { 0, 0, 0, 0, 0},
+      { 1, 0,-1,-1, 0},
+      { 1, 1,-1,-1, 0}, //m
+      { 1, 0,-1,-1, 0},
+      { 0, 0, 0, 0, 0},
+    };      //m
+    MATRIX_updatemat(matrix, reference, pheromone, prevX, prevY);
+  }
+  else{
+    int reference[5][5] = {
+      { 0, 0, 0, 0, 0},
+      {-1,-1, 0, 1, 0},
+      {-1,-1, 1, 1, 0}, //m
+      {-1,-1, 0, 1, 0},
+      { 0, 0, 0, 0, 0}
+    };      //m
+    MATRIX_updatemat(matrix, reference, pheromone, prevX, prevY);
+  }
+}
+void MATRIX_6(float matrix[width][height],float pheromone, int larger){
+  if(larger){
+    int reference[5][5] = {
+      { 0, 0, 0, 0, 0},
+      { 0,-1,-1, 0, 1},
+      { 0,-1,-1, 1, 1}, //m
+      { 0,-1,-1, 0, 1},
+      { 0, 0, 0, 0, 0},
+    };      //m
+    MATRIX_updatemat(matrix, reference, pheromone, prevX, prevY);
+  }
+  else{
+    int reference[5][5] = {
+      { 0, 0, 0, 0, 0},
+      { 0, 1, 0,-1,-1},
+      { 0, 1, 1,-1,-1}, //m
+      { 0, 1, 0,-1,-1},
+      { 0, 0, 0, 0, 0}
+    };      //m
+    MATRIX_updatemat(matrix, reference, pheromone, prevX, prevY);
+  }
+}
+void MATRIX_7(float matrix[width][height],float pheromone, int larger){
+  if(larger){
+    int reference[5][5] = {
+      { 0, 0, 0, 0, 0},
+      { 0,-1,-1,-1, 0},
+      { 1, 0,-1,-1, 0}, //m
+      { 1, 1, 0,-1, 0},
+      { 1, 1, 1, 0, 0},
+    };      //m
+    MATRIX_updatemat(matrix, reference, pheromone, prevX, prevY);
+  }
+  else{
+    int reference[5][5] = {
+      { 0, 0, 0, 0, 0},
+      { 0, 1, 1, 1, 0},
+      {-1, 0, 1, 1, 0}, //m
+      {-1,-1, 0, 1, 0},
+      {-1,-1,-1, 0, 0}
+    };      //m
+    MATRIX_updatemat(matrix, reference, pheromone, prevX, prevY);
+  }
+}
+void MATRIX_8(float matrix[width][height],float pheromone, int larger){
+  if(larger){
+    int reference[5][5] = {
+      { 0, 0, 0, 0, 0},
+      { 0,-1,-1,-1, 0},
+      { 0,-1,-1,-1, 0}, //m
+      { 0, 0, 1, 0, 0},
+      { 0, 1, 1, 1, 0},
+    };      //m
+    MATRIX_updatemat(matrix, reference, pheromone, prevX, prevY);
+  }
+  else{
+    int reference[5][5] = {
+      { 0, 0, 0, 0, 0},
+      { 0, 1, 1, 1, 0},
+      { 0, 0, 1, 0, 0}, //m
+      { 0,-1,-1,-1, 0},
+      { 0,-1,-1,-1, 0}
+    };      //m
+    MATRIX_updatemat(matrix, reference, pheromone, prevX, prevY);
+  }
+}
+void MATRIX_9(float matrix[width][height],float pheromone, int larger){
+  if(larger){
+    int reference[5][5] = {
+      { 0, 0, 0, 0, 0},
+      { 0,-1,-1,-1, 0},
+      { 0,-1,-1, 0, 1}, //m
+      { 0,-1, 0, 1, 1},
+      { 0, 0, 1, 1, 1},
+    };      //m
+    MATRIX_updatemat(matrix, reference, pheromone, prevX, prevY);
+  }
+  else{
+    int reference[5][5] = {
+      { 0, 0, 0, 0, 0},
+      { 0, 1, 1, 1, 0},
+      { 0, 1, 1, 0,-1}, //m
+      { 0, 1, 0,-1,-1},
+      { 0, 0,-1,-1,-1}
+    };      //m
+    MATRIX_updatemat(matrix, reference, pheromone, prevX, prevY);
+  }
+}
+void MATRIX_updatemat(float matrix[width][height], int reference[5][5], float pheromone, int posx, int posy){
+  //shift the center to top left corner, eg (2,2) -> (0,0), (8,5) -> (6,3)
+  int x = posx - 2;
+  int y = posy - 2;
+  float pheromoneval = 0;
+  for(int i=0;i<5;i++){
+    for(int j=0;j<5;j++){
+      pheromoneval = (float)reference[i][j]*pheromone;  //either plus or minus or nothing depending on reference
+      MATRIX_updatecell(matrix, pheromoneval, x+i, y+j);
+    }
+  }
+}
+void MATRIX_updatecell(float matrix[width][height], float pheromone, int posx, int posy){
+  //Check if position within bounds
+  if( (posx >= 0) && (posy >= 0) && (posx < width) && (posy < height)){
+    //check if position has obstacle, or if after deducting will be less than 0
+    if( (matrix[posx][posy] > 0) ){ //if position is not obstacle (-1)
+      if( (matrix[posx][posy] + pheromone) < 0) //if after deduct is less than 0
+        matrix[posx][posy] = 0; //directly 0
+      else
+        matrix[posx][posy] += pheromone;
+    }
+  }
+}
+void MATRIX_Bump(){
+  L_bumped = 0; R_bumped = 0; F_bumped = 0; B_bumped = 0;
+  distanceToMove = (float)WHEEL_CIRCUMFERENCE/20;
+  distanceToMove = (float)movedTss*distanceToMove;
+  if(!B_bumped)
+    PID_Backward();
+  else
+    PID_Forward();
+  distanceToMove = 100;
+  MATRIX_bumped = 1;
+}
+void MATRIX_reset(float matrix[width][height]){
+  for(int i=0;i<height;i++){
+    for(int j=0;j<width;j++){
+      matrix[i][j] = (float)initialPheromone;
+    }
+  }
+}
+void MATRIX_print(float matrix[width][height]){
+  for(int i=0;i<height;i++){  //i is row, X
+    for(int j=0;j<width;j++){ //j is column, Y
+      if(j == currY && i == currX)
+        Serial.printf("[%.2f]",matrix[i][j]);
+      else
+        Serial.printf(" %.2f ",matrix[i][j]);
+    }
+    Serial.println("");
+  }
+  Serial.println("");
+}
+float calcVisibility(){
+  int nodeNum = 0;
+  float visibility = 0;
+  for(int i=0;i<(currentNodeCount-1);i++){  //sum of all distance excluding root
+    if(availableNetworks[i].intmac != ROOTID){
+      visibility += (1.0/availableNetworks[i].distance);  //shorter distance = higher value
+      nodeNum++;
+    }
+  }
+  if(nodeNum >= 1){ //if there are other nodes excluding root
+    visibility = (float)visibility/nodeNum; //get average visibility
+    return visibility;
+  }
+  return 0; //nothing visible, or nothing nearby or exist
+}
+float calcRootVisibility(){
+  bool foundRoot = 0;
+  int nodeNum = 0;
+  float visibility = 0;
+  for(int i=0;i<(currentNodeCount-1);i++){  //sum of all distances including root
+    visibility += (1.0/availableNetworks[i].distance);  //shorter distance = hier value
+    nodeNum++;
+    if(availableNetworks[i].intmac == ROOTID)
+      foundRoot = 1;
+  }
+  if(foundRoot){  //if root is found
+    visibility = (float)visibility/nodeNum; //get average visibility
+    return visibility;
+  }
+  return 0; //if root not found, return 0
+}
+/*End of ACO Movement Code----------------------------------------------------*/
 /*Master Code-----------------------------------------------------------------*/
 Task master(10,TASK_FOREVER,&Master);
 
@@ -2009,88 +2499,76 @@ long int startup_timer = 0;
 
 long int wait_time = 0;
 int Master(){
-  if(millis() - startup_timer < 10000){ //wait 10 sec
+  if(!START){ //wait for command to start moving
+    LED_1(0);
+    LED_0(0);
     return 0;
   }
-  if(currentMaster == selfNodeID){
-    if(step_counter == 0){
-      waitForNodes(); //wait for all units
-    }
-    if(step_counter == 1){
-      if(!startScan){  //if havent started scan, start scanning WiFi
-        scanNodes.restart();
-        Serial.println(startScan);
+  else{
+    if(isROOT){
+      if(step_counter == 0){
+        waitForNodes();
       }
-      if(getScan){    //if WiFi scanning done and saved WiFi details
-        startScan = 0;
-        getScan = 0;
-        step_counter = 0;
-      }
-    }
-  }
-  else if(found_Master == 0){
-   if(step_counter == 0){
-      if(!startScan){  //if havent started scan, start scanning WiFi
-        scanNodes.restart();
-        Serial.println(startScan);
-      }
-      if(getScan){    //if WiFi scanning done and saved WiFi details
-        startScan = 0;
-        getScan = 0;
-        pingMaster();
-        step_counter++;
-      }
-    }
-    if(step_counter == 1){
-      waitForMaster();
-    }
-    if(step_counter == 2){
-      if(mode_front)
-        PID_Forward();
-      else
-        PID_Backward();
-      step_counter++;
-    }
-    if(step_counter == 3){
-      if(wait_time == 0){
-        wait_time = millis();
-      }
-      else if((millis() - wait_time) >= 3000){
-        if(!startScan){  //if havent started scan, start scanning WiFi
+      if(step_counter == 1){
+        if(!startScan){
           scanNodes.restart();
-          Serial.println(startScan);
         }
-        if(getScan){    //if WiFi scanning done and saved WiFi details
+        if(getScan){
           startScan = 0;
           getScan = 0;
-          pingMaster();
           step_counter++;
         }
       }
-    }
-    if(step_counter == 4){
-      waitForMaster();
-    }
-    if(step_counter == 5){
-      FaceTarget(currentMaster);
-      if(found_Master){
-       return 0; 
-      }
-      step_counter++;
-    }
-    if(step_counter == 6){
-      PID_Forward();
-      step_counter++;
-    }
-    if(step_counter == 7){
-      if(wait_time == 0){
-        wait_time = millis();
-      }
-      else if((millis() - wait_time) >= 3000){
-        PID_North();
-        mode_front = !mode_front;
+      if(step_counter == 2){
+        pingNodes();
+        step_counter++;
+        Serial.println("done");
         step_counter = 0;
       }
+    }
+    else{
+      if(step_counter == 0){
+        waitForSeconds(3);
+      }
+      if(step_counter == 1){
+        if(!startScan){
+          scanNodes.restart();
+        }
+        if(getScan){
+          startScan = 0;
+          getScan = 0;
+          step_counter++;
+          pingRoot();
+        }
+      }
+      if(step_counter == 2){
+        waitForRoot();
+      }
+      if(step_counter == 3){
+        LED_1(0);
+        MATRIX_update();                //update pheromone
+        MATRIX_selectdirection();       //decide direction
+        MATRIX_move(MATRIX_direction);  //move to direction
+        step_counter++;
+      }
+      if(step_counter == 4){
+        Serial.println("done");
+        step_counter = 0;
+      }
+    }
+  }
+}
+bool startwaiting = 0;
+long int waitforseconds = 0;
+void waitForSeconds(int seconds){
+  if(!startwaiting){
+    waitforseconds = millis();
+    startwaiting = 1;
+  }
+  else{
+    if(millis() - waitforseconds > (seconds*1000)){
+      startwaiting = 0;
+      step_counter++;
     }
   }
 }
@@ -2132,6 +2610,7 @@ void setup() {
     }
     mesh_Setup();
     WiFi_Setup();
+    MATRIX_Setup();
   }
   else {
     mesh_Setup();
@@ -2140,7 +2619,7 @@ void setup() {
   }
   startup_timer = millis();
   taskScheduler.addTask(master);
-  //master.enable();
+  master.enable();
 }
 
 void loop() {
